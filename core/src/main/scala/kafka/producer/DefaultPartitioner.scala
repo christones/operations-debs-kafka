@@ -17,13 +17,13 @@
 
 package kafka.producer
 
-private[kafka] class DefaultPartitioner[T] extends Partitioner[T] {
+
+import kafka.utils._
+
+private class DefaultPartitioner[T](props: VerifiableProperties = null) extends Partitioner[T] {
   private val random = new java.util.Random
   
   def partition(key: T, numPartitions: Int): Int = {
-    if(key == null)
-      random.nextInt(numPartitions)
-    else
-      math.abs(key.hashCode) % numPartitions
+    Utils.abs(key.hashCode) % numPartitions
   }
 }

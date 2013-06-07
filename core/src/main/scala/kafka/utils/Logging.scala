@@ -23,12 +23,13 @@ trait Logging {
   val loggerName = this.getClass.getName
   lazy val logger = Logger.getLogger(loggerName)
 
-  protected var logIdent = ""
+  protected var logIdent: String = null
 
   // Force initialization to register Log4jControllerMBean
   private val log4jController = Log4jController
 
-  private def msgWithLogIdent(msg: String) = "%s%s".format(logIdent, msg)
+  private def msgWithLogIdent(msg: String) = 
+    if(logIdent == null) msg else logIdent + msg
 
   def trace(msg: => String): Unit = {
     if (logger.isTraceEnabled())
@@ -41,6 +42,9 @@ trait Logging {
   def trace(msg: => String, e: => Throwable) = {
     if (logger.isTraceEnabled())
       logger.trace(msgWithLogIdent(msg),e)
+  }
+  def swallowTrace(action: => Unit) {
+    Utils.swallow(logger.trace, action)
   }
 
   def debug(msg: => String): Unit = {
@@ -55,6 +59,9 @@ trait Logging {
     if (logger.isDebugEnabled())
       logger.debug(msgWithLogIdent(msg),e)
   }
+  def swallowDebug(action: => Unit) {
+    Utils.swallow(logger.debug, action)
+  }
 
   def info(msg: => String): Unit = {
     if (logger.isInfoEnabled())
@@ -68,6 +75,9 @@ trait Logging {
     if (logger.isInfoEnabled())
       logger.info(msgWithLogIdent(msg),e)
   }
+  def swallowInfo(action: => Unit) {
+    Utils.swallow(logger.info, action)
+  }
 
   def warn(msg: => String): Unit = {
     logger.warn(msgWithLogIdent(msg))
@@ -77,7 +87,11 @@ trait Logging {
   }
   def warn(msg: => String, e: => Throwable) = {
     logger.warn(msgWithLogIdent(msg),e)
-  }	
+  }
+  def swallowWarn(action: => Unit) {
+    Utils.swallow(logger.warn, action)
+  }
+  def swallow(action: => Unit) = swallowWarn(action)
 
   def error(msg: => String): Unit = {
     logger.error(msgWithLogIdent(msg))
@@ -87,6 +101,9 @@ trait Logging {
   }
   def error(msg: => String, e: => Throwable) = {
     logger.error(msgWithLogIdent(msg),e)
+  }
+  def swallowError(action: => Unit) {
+    Utils.swallow(logger.error, action)
   }
 
   def fatal(msg: => String): Unit = {

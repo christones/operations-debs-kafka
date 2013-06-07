@@ -18,20 +18,24 @@
 package kafka.consumer
 
 import java.util.Properties
-import kafka.utils.{ZKConfig, Utils}
 import kafka.api.OffsetRequest
-object ConsumerConfig {
+import kafka.utils._
+import kafka.common.{InvalidConfigException, Config}
+
+object ConsumerConfig extends Config {
   val SocketTimeout = 30 * 1000
   val SocketBufferSize = 64*1024
   val FetchSize = 1024 * 1024
   val MaxFetchSize = 10*FetchSize
   val DefaultFetcherBackoffMs = 1000
   val AutoCommit = true
-  val AutoCommitInterval = 10 * 1000
+  val AutoCommitInterval = 60 * 1000
   val MaxQueuedChunks = 10
   val MaxRebalanceRetries = 4
   val AutoOffsetReset = OffsetRequest.SmallestTimeString
   val ConsumerTimeoutMs = -1
+  val MinFetchBytes = 1
+  val MaxFetchWaitMs = 100
   val MirrorTopicsWhitelist = ""
   val MirrorTopicsBlacklist = ""
   val MirrorConsumerNumThreads = 1
@@ -39,60 +43,94 @@ object ConsumerConfig {
   val MirrorTopicsWhitelistProp = "mirror.topics.whitelist"
   val MirrorTopicsBlacklistProp = "mirror.topics.blacklist"
   val MirrorConsumerNumThreadsProp = "mirror.consumer.numthreads"
+  val DefaultClientId = ""
+
+  def validate(config: ConsumerConfig) {
+    validateClientId(config.clientId)
+    validateGroupId(config.groupId)
+    validateAutoOffsetReset(config.autoOffsetReset)
+  }
+
+  def validateClientId(clientId: String) {
+    validateChars("client.id", clientId)
+  }
+
+  def validateGroupId(groupId: String) {
+    validateChars("group.id", groupId)
+  }
+
+  def validateAutoOffsetReset(autoOffsetReset: String) {
+    autoOffsetReset match {
+      case OffsetRequest.SmallestTimeString =>
+      case OffsetRequest.LargestTimeString =>
+      case _ => throw new InvalidConfigException("Wrong value " + autoOffsetReset + " of auto.offset.reset in ConsumerConfig; " +
+                                                 "Valid values are " + OffsetRequest.SmallestTimeString + " and " + OffsetRequest.LargestTimeString)
+    }
+  }
 }
 
-class ConsumerConfig(props: Properties) extends ZKConfig(props) {
+class ConsumerConfig private (val props: VerifiableProperties) extends ZKConfig(props) {
   import ConsumerConfig._
 
+  def this(originalProps: Properties) {
+    this(new VerifiableProperties(originalProps))
+    props.verify()
+  }
+
   /** a string that uniquely identifies a set of consumers within the same consumer group */
-  val groupId = Utils.getString(props, "groupid")
+  val groupId = props.getString("group.id")
 
   /** consumer id: generated automatically if not set.
    *  Set this explicitly for only testing purpose. */
-  val consumerId: Option[String] = /** TODO: can be written better in scala 2.8 */
-    if (Utils.getString(props, "consumerid", null) != null) Some(Utils.getString(props, "consumerid")) else None
+  val consumerId: Option[String] = Option(props.getString("consumer.id", null))
 
-  /** the socket timeout for network requests */
-  val socketTimeoutMs = Utils.getInt(props, "socket.timeout.ms", SocketTimeout)
+  /** the socket timeout for network requests. The actual timeout set will be max.fetch.wait + socket.timeout.ms. */
+  val socketTimeoutMs = props.getInt("socket.timeout.ms", SocketTimeout)
   
   /** the socket receive buffer for network requests */
-  val socketBufferSize = Utils.getInt(props, "socket.buffersize", SocketBufferSize)
+  val socketReceiveBufferBytes = props.getInt("socket.receive.buffer.bytes", SocketBufferSize)
   
   /** the number of byes of messages to attempt to fetch */
-  val fetchSize = Utils.getInt(props, "fetch.size", FetchSize)
-  
-  /** to avoid repeatedly polling a broker node which has no new data
-      we will backoff every time we get an empty set from the broker*/
-  val fetcherBackoffMs: Long = Utils.getInt(props, "fetcher.backoff.ms", DefaultFetcherBackoffMs)
+  val fetchMessageMaxBytes = props.getInt("fetch.message.max.bytes", FetchSize)
   
   /** if true, periodically commit to zookeeper the offset of messages already fetched by the consumer */
-  val autoCommit = Utils.getBoolean(props, "autocommit.enable", AutoCommit)
+  val autoCommitEnable = props.getBoolean("auto.commit.enable", AutoCommit)
   
   /** the frequency in ms that the consumer offsets are committed to zookeeper */
-  val autoCommitIntervalMs = Utils.getInt(props, "autocommit.interval.ms", AutoCommitInterval)
+  val autoCommitIntervalMs = props.getInt("auto.commit.interval.ms", AutoCommitInterval)
 
   /** max number of messages buffered for consumption */
-  val maxQueuedChunks = Utils.getInt(props, "queuedchunks.max", MaxQueuedChunks)
+  val queuedMaxMessages = props.getInt("queued.max.messages", MaxQueuedChunks)
 
   /** max number of retries during rebalance */
-  val maxRebalanceRetries = Utils.getInt(props, "rebalance.retries.max", MaxRebalanceRetries)
-
+  val rebalanceMaxRetries = props.getInt("rebalance.max.retries", MaxRebalanceRetries)
+  
+  /** the minimum amount of data the server should return for a fetch request. If insufficient data is available the request will block */
+  val fetchMinBytes = props.getInt("fetch.min.bytes", MinFetchBytes)
+  
+  /** the maximum amount of time the server will block before answering the fetch request if there isn't sufficient data to immediately satisfy fetch.min.bytes */
+  val fetchWaitMaxMs = props.getInt("fetch.wait.max.ms", MaxFetchWaitMs)
+  
   /** backoff time between retries during rebalance */
-  val rebalanceBackoffMs = Utils.getInt(props, "rebalance.backoff.ms", zkSyncTimeMs)
+  val rebalanceBackoffMs = props.getInt("rebalance.backoff.ms", zkSyncTimeMs)
+
+  /** backoff time to refresh the leader of a partition after it loses the current leader */
+  val refreshLeaderBackoffMs = props.getInt("refresh.leader.backoff.ms", 200)
 
   /* what to do if an offset is out of range.
      smallest : automatically reset the offset to the smallest offset
      largest : automatically reset the offset to the largest offset
      anything else: throw exception to the consumer */
-  val autoOffsetReset = Utils.getString(props, "autooffset.reset", AutoOffsetReset)
+  val autoOffsetReset = props.getString("auto.offset.reset", AutoOffsetReset)
 
   /** throw a timeout exception to the consumer if no message is available for consumption after the specified interval */
-  val consumerTimeoutMs = Utils.getInt(props, "consumer.timeout.ms", ConsumerTimeoutMs)
+  val consumerTimeoutMs = props.getInt("consumer.timeout.ms", ConsumerTimeoutMs)
 
-  /** Use shallow iterator over compressed messages directly. This feature should be used very carefully.
-   *  Typically, it's only used for mirroring raw messages from one kafka cluster to another to save the
-   *  overhead of decompression.
-   *  */
-  val enableShallowIterator = Utils.getBoolean(props, "shallowiterator.enable", false)
+  /**
+   * Client id is specified by the kafka consumer client, used to distinguish different clients
+   */
+  val clientId = props.getString("client.id", groupId)
+
+  validate(this)
 }
 

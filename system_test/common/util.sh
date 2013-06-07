@@ -41,7 +41,7 @@ get_random_range() {
     up=$2
     range=$(($up - $lo + 1))
 
-    return $(($(($RANDOM % range)) + $lo))
+    echo $(($(($RANDOM % range)) + $lo))
 }
 
 # =========================================
@@ -72,7 +72,7 @@ kill_child_processes() {
 #    from the settings in config/server.properties while the brokerid and
 #    server port will be incremented accordingly
 # 3. to generate properties files with non-default values such as 
-#    "socket.send.buffer=2097152", simply add the property with new value
+#    "socket.send.buffer.bytes=2097152", simply add the property with new value
 #    to the array variable kafka_properties_to_replace as shown below
 # =========================================================================
 generate_kafka_properties_files() {
@@ -103,10 +103,10 @@ generate_kafka_properties_files() {
     # values. Other kafka properties can be added
     # in a similar fashion.
     # =============================================
-    # kafka_properties_to_replace[1]="socket.send.buffer=2097152"
-    # kafka_properties_to_replace[2]="socket.receive.buffer=2097152"
+    # kafka_properties_to_replace[1]="socket.send.buffer.bytes=2097152"
+    # kafka_properties_to_replace[2]="socket.receive.buffer.bytes=2097152"
     # kafka_properties_to_replace[3]="num.partitions=3"
-    # kafka_properties_to_replace[4]="max.socket.request.bytes=10485760"
+    # kafka_properties_to_replace[4]="socket.request.max.bytes=10485760"
 
     server_properties=`cat ${this_config_dir}/server.properties`
 
@@ -134,7 +134,7 @@ generate_kafka_properties_files() {
         # ======================
         keyword_to_replace="brokerid="
         string_to_be_replaced=`echo "$server_properties" | grep $keyword_to_replace`
-        brokerid_idx=$(( $brokerid_to_start + $i - 1 ))
+        brokerid_idx=$(( $brokerid_to_start + $i))
         string_to_replace="${keyword_to_replace}${brokerid_idx}"
         # info "string to be replaced : [${string_to_be_replaced}]"
         # info "string to replace     : [${string_to_replace}]"

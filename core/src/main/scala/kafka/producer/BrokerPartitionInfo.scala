@@ -16,44 +16,81 @@
 */
 package kafka.producer
 
-import collection.mutable.Map
-import collection.SortedSet
-import kafka.cluster.{Broker, Partition}
+import collection.mutable.HashMap
+import kafka.api.TopicMetadata
+import kafka.common.KafkaException
+import kafka.utils.Logging
+import kafka.common.ErrorMapping
+import kafka.client.ClientUtils
 
-trait BrokerPartitionInfo {
+
+class BrokerPartitionInfo(producerConfig: ProducerConfig,
+                          producerPool: ProducerPool,
+                          topicPartitionInfo: HashMap[String, TopicMetadata])
+        extends Logging {
+  val brokerList = producerConfig.brokerList
+  val brokers = ClientUtils.parseBrokerList(brokerList)
+
   /**
    * Return a sequence of (brokerId, numPartitions).
    * @param topic the topic for which this information is to be returned
    * @return a sequence of (brokerId, numPartitions). Returns a zero-length
    * sequence if no brokers are available.
-   */  
-  def getBrokerPartitionInfo(topic: String = null): SortedSet[Partition]
+   */
+  def getBrokerPartitionInfo(topic: String, correlationId: Int): Seq[PartitionAndLeader] = {
+    debug("Getting broker partition info for topic %s".format(topic))
+    // check if the cache has metadata for this topic
+    val topicMetadata = topicPartitionInfo.get(topic)
+    val metadata: TopicMetadata =
+      topicMetadata match {
+        case Some(m) => m
+        case None =>
+          // refresh the topic metadata cache
+          updateInfo(Set(topic), correlationId)
+          val topicMetadata = topicPartitionInfo.get(topic)
+          topicMetadata match {
+            case Some(m) => m
+            case None => throw new KafkaException("Failed to fetch topic metadata for topic: " + topic)
+          }
+      }
+    val partitionMetadata = metadata.partitionsMetadata
+    partitionMetadata.map { m =>
+      m.leader match {
+        case Some(leader) =>
+          debug("Topic %s partition %d has leader %d".format(topic, m.partitionId, leader.id))
+          new PartitionAndLeader(topic, m.partitionId, Some(leader.id))
+        case None =>
+          debug("Topic %s partition %d does not have a leader yet".format(topic, m.partitionId))
+          new PartitionAndLeader(topic, m.partitionId, None)
+      }
+    }.sortWith((s, t) => s.partitionId < t.partitionId)
+  }
 
   /**
-   * Generate the host and port information for the broker identified
-   * by the given broker id 
-   * @param brokerId the broker for which the info is to be returned
-   * @return host and port of brokerId
+   * It updates the cache by issuing a get topic metadata request to a random broker.
+   * @param topics the topics for which the metadata is to be fetched
    */
-  def getBrokerInfo(brokerId: Int): Option[Broker]
-
-  /**
-   * Generate a mapping from broker id to the host and port for all brokers
-   * @return mapping from id to host and port of all brokers
-   */
-  def getAllBrokerInfo: Map[Int, Broker]
-
-  /**
-   * This is relevant to the ZKBrokerPartitionInfo. It updates the ZK cache
-   * by reading from zookeeper and recreating the data structures. This API
-   * is invoked by the producer, when it detects that the ZK cache of
-   * ZKBrokerPartitionInfo is stale.
-   *
-   */
-  def updateInfo
-
-  /**
-   * Cleanup
-   */
-  def close
+  def updateInfo(topics: Set[String], correlationId: Int) {
+    var topicsMetadata: Seq[TopicMetadata] = Nil
+    val topicMetadataResponse = ClientUtils.fetchTopicMetadata(topics, brokers, producerConfig, correlationId)
+    topicsMetadata = topicMetadataResponse.topicsMetadata
+    // throw partition specific exception
+    topicsMetadata.foreach(tmd =>{
+      trace("Metadata for topic %s is %s".format(tmd.topic, tmd))
+      if(tmd.errorCode == ErrorMapping.NoError){
+        topicPartitionInfo.put(tmd.topic, tmd)
+      } else
+        warn("Error while fetching metadata [%s] for topic [%s]: %s ".format(tmd, tmd.topic, ErrorMapping.exceptionFor(tmd.errorCode).getClass))
+      tmd.partitionsMetadata.foreach(pmd =>{
+        if (pmd.errorCode != ErrorMapping.NoError && pmd.errorCode == ErrorMapping.LeaderNotAvailableCode) {
+          warn("Error while fetching metadata %s for topic partition [%s,%d]: [%s]".format(pmd, tmd.topic, pmd.partitionId,
+            ErrorMapping.exceptionFor(pmd.errorCode).getClass))
+        } // any other error code (e.g. ReplicaNotAvailable) can be ignored since the producer does not need to access the replica and isr metadata
+      })
+    })
+    producerPool.updateProducer(topicsMetadata)
+  }
+  
 }
+
+case class PartitionAndLeader(topic: String, partitionId: Int, leaderBrokerIdOpt: Option[Int])

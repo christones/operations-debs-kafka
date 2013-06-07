@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.nio.channels.ClosedByInterruptException
 import org.apache.log4j.Logger
 import kafka.message.Message
-import kafka.utils.Utils
+import kafka.utils.ZkUtils
 import java.util.{Random, Properties}
 import kafka.consumer._
 import java.text.SimpleDateFormat
@@ -48,18 +48,18 @@ object ConsumerPerformance {
     }
 
     // clean up zookeeper state for this group id for every perf run
-    Utils.tryCleanupZookeeper(config.consumerConfig.zkConnect, config.consumerConfig.groupId)
+    ZkUtils.maybeDeletePath(config.consumerConfig.zkConnect, "/consumers/" + config.consumerConfig.groupId)
 
     val consumerConnector: ConsumerConnector = Consumer.create(config.consumerConfig)
 
-    val topicMessageStreams = consumerConnector.createMessageStreams(Predef.Map(config.topic -> config.numThreads))
+    val topicMessageStreams = consumerConnector.createMessageStreams(Map(config.topic -> config.numThreads))
     var threadList = List[ConsumerPerfThread]()
     for ((topic, streamList) <- topicMessageStreams)
       for (i <- 0 until streamList.length)
         threadList ::= new ConsumerPerfThread(i, "kafka-zk-consumer-" + i, streamList(i), config,
                                               totalMessagesRead, totalBytesRead)
 
-    logger.info("Sleeping for 1000 seconds.")
+    logger.info("Sleeping for 1 second.")
     Thread.sleep(1000)
     logger.info("starting threads")
     val startMs = System.currentTimeMillis
@@ -74,7 +74,7 @@ object ConsumerPerformance {
     if(!config.showDetailedStats) {
       val totalMBRead = (totalBytesRead.get*1.0)/(1024*1024)
       println(("%s, %s, %d, %.4f, %.4f, %d, %.4f").format(config.dateFormat.format(startMs), config.dateFormat.format(endMs),
-        config.consumerConfig.fetchSize, totalMBRead, totalMBRead/elapsedSecs, totalMessagesRead.get,
+        config.consumerConfig.fetchMessageMaxBytes, totalMBRead, totalMBRead/elapsedSecs, totalMessagesRead.get,
         totalMessagesRead.get/elapsedSecs))
     }
     System.exit(0)
@@ -86,6 +86,10 @@ object ConsumerPerformance {
                            .withRequiredArg
                            .describedAs("urls")
                            .ofType(classOf[String])
+    val topicOpt = parser.accepts("topic", "REQUIRED: The topic to consume from.")
+      .withRequiredArg
+      .describedAs("topic")
+      .ofType(classOf[String])
     val groupIdOpt = parser.accepts("group", "The group id to consume on.")
                            .withRequiredArg
                            .describedAs("gid")
@@ -120,10 +124,10 @@ object ConsumerPerformance {
     }
 
     val props = new Properties
-    props.put("groupid", options.valueOf(groupIdOpt))
-    props.put("socket.buffer.size", options.valueOf(socketBufferSizeOpt).toString)
-    props.put("fetch.size", options.valueOf(fetchSizeOpt).toString)
-    props.put("autooffset.reset", if(options.has(resetBeginningOffsetOpt)) "largest" else "smallest")
+    props.put("group.id", options.valueOf(groupIdOpt))
+    props.put("socket.receive.buffer.bytes", options.valueOf(socketBufferSizeOpt).toString)
+    props.put("fetch.message.max.bytes", options.valueOf(fetchSizeOpt).toString)
+    props.put("auto.offset.reset", if(options.has(resetBeginningOffsetOpt)) "largest" else "smallest")
     props.put("zk.connect", options.valueOf(zkConnectOpt))
     props.put("consumer.timeout.ms", "5000")
     val consumerConfig = new ConsumerConfig(props)
@@ -136,7 +140,7 @@ object ConsumerPerformance {
     val hideHeader = options.has(hideHeaderOpt)
   }
 
-  class ConsumerPerfThread(threadId: Int, name: String, stream: KafkaStream[Message],
+  class ConsumerPerfThread(threadId: Int, name: String, stream: KafkaStream[Array[Byte], Array[Byte]],
                            config:ConsumerPerfConfig, totalMessagesRead: AtomicLong, totalBytesRead: AtomicLong)
     extends Thread(name) {
     private val shutdownLatch = new CountDownLatch(1)
@@ -156,7 +160,7 @@ object ConsumerPerformance {
       try {
         for (messageAndMetadata <- stream if messagesRead < config.numMessages) {
           messagesRead += 1
-          bytesRead += messageAndMetadata.message.payloadSize
+          bytesRead += messageAndMetadata.message.length
 
           if (messagesRead % config.reportingInterval == 0) {
             if(config.showDetailedStats)
@@ -186,7 +190,7 @@ object ConsumerPerformance {
       val totalMBRead = (bytesRead*1.0)/(1024*1024)
       val mbRead = ((bytesRead - lastBytesRead)*1.0)/(1024*1024)
       println(("%s, %d, %d, %.4f, %.4f, %d, %.4f").format(config.dateFormat.format(endMs), id,
-        config.consumerConfig.fetchSize, totalMBRead,
+        config.consumerConfig.fetchMessageMaxBytes, totalMBRead,
         1000.0*(mbRead/elapsedMs), messagesRead, ((messagesRead - lastMessagesRead)/elapsedMs)*1000.0))
     }
 

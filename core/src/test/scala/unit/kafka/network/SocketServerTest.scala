@@ -21,42 +21,53 @@ import java.net._
 import java.io._
 import org.junit._
 import org.scalatest.junit.JUnitSuite
-import kafka.utils.TestUtils
 import java.util.Random
-import org.apache.log4j._
+import junit.framework.Assert._
+import kafka.producer.SyncProducerConfig
+import kafka.api.ProducerRequest
+import java.nio.ByteBuffer
+import kafka.common.TopicAndPartition
+import kafka.message.ByteBufferMessageSet
+import java.nio.channels.SelectionKey
+
 
 class SocketServerTest extends JUnitSuite {
 
-  Logger.getLogger("kafka").setLevel(Level.INFO)
-
-  def echo(receive: Receive): Option[Send] = {
-    val id = receive.buffer.getShort
-    Some(new BoundedByteBufferSend(receive.buffer.slice))
-  }
-  
-  val server = new SocketServer(port = TestUtils.choosePort, 
-                                numProcessorThreads = 1, 
-                                monitoringPeriodSecs = 30, 
-                                handlerFactory = (requestId: Short, receive: Receive) => echo, 
-                                sendBufferSize = 300000,
-                                receiveBufferSize = 300000,
-                                maxRequestSize = 50)
+  val server: SocketServer = new SocketServer(0,
+                                              host = null,
+                                              port = kafka.utils.TestUtils.choosePort,
+                                              numProcessorThreads = 1,
+                                              maxQueuedRequests = 50,
+                                              maxRequestSize = 50)
   server.startup()
 
-  def sendRequest(id: Short, request: Array[Byte]): Array[Byte] = {
-    val socket = new Socket("localhost", server.port)
+  def sendRequest(socket: Socket, id: Short, request: Array[Byte]) {
     val outgoing = new DataOutputStream(socket.getOutputStream)
     outgoing.writeInt(request.length + 2)
     outgoing.writeShort(id)
     outgoing.write(request)
     outgoing.flush()
+  }
+
+  def receiveResponse(socket: Socket): Array[Byte] = { 
     val incoming = new DataInputStream(socket.getInputStream)
     val len = incoming.readInt()
     val response = new Array[Byte](len)
     incoming.readFully(response)
-    socket.close()
     response
   }
+
+  /* A simple request handler that just echos back the response */
+  def processRequest(channel: RequestChannel) {
+    val request = channel.receiveRequest
+    val byteBuffer = ByteBuffer.allocate(request.requestObj.sizeInBytes)
+    request.requestObj.writeTo(byteBuffer)
+    byteBuffer.rewind()
+    val send = new BoundedByteBufferSend(byteBuffer)
+    channel.sendResponse(new RequestChannel.Response(request.processor, request, send))
+  }
+
+  def connect() = new Socket("localhost", server.port)
 
   @After
   def cleanup() {
@@ -65,15 +76,64 @@ class SocketServerTest extends JUnitSuite {
 
   @Test
   def simpleRequest() {
-    val response = new String(sendRequest(0, "hello".getBytes))
-    
+    val socket = connect()
+    val correlationId = -1
+    val clientId = SyncProducerConfig.DefaultClientId
+    val ackTimeoutMs = SyncProducerConfig.DefaultAckTimeoutMs
+    val ack = SyncProducerConfig.DefaultRequiredAcks
+    val emptyRequest =
+      new ProducerRequest(correlationId, clientId, ack, ackTimeoutMs, collection.mutable.Map[TopicAndPartition, ByteBufferMessageSet]())
+
+    val byteBuffer = ByteBuffer.allocate(emptyRequest.sizeInBytes)
+    emptyRequest.writeTo(byteBuffer)
+    byteBuffer.rewind()
+    val serializedBytes = new Array[Byte](byteBuffer.remaining)
+    byteBuffer.get(serializedBytes)
+
+    sendRequest(socket, 0, serializedBytes)
+    processRequest(server.requestChannel)
+    assertEquals(serializedBytes.toSeq, receiveResponse(socket).toSeq)
   }
 
   @Test(expected=classOf[IOException])
   def tooBigRequestIsRejected() {
     val tooManyBytes = new Array[Byte](server.maxRequestSize + 1)
     new Random().nextBytes(tooManyBytes)
-    sendRequest(0, tooManyBytes)
+    val socket = connect()
+    sendRequest(socket, 0, tooManyBytes)
+    receiveResponse(socket)
   }
 
+  @Test
+  def testPipelinedRequestOrdering() {
+    val socket = connect()
+    val correlationId = -1
+    val clientId = SyncProducerConfig.DefaultClientId
+    val ackTimeoutMs = SyncProducerConfig.DefaultAckTimeoutMs
+    val ack: Short = 0
+    val emptyRequest =
+      new ProducerRequest(correlationId, clientId, ack, ackTimeoutMs, collection.mutable.Map[TopicAndPartition, ByteBufferMessageSet]())
+
+    val byteBuffer = ByteBuffer.allocate(emptyRequest.sizeInBytes)
+    emptyRequest.writeTo(byteBuffer)
+    byteBuffer.rewind()
+    val serializedBytes = new Array[Byte](byteBuffer.remaining)
+    byteBuffer.get(serializedBytes)
+
+    sendRequest(socket, 0, serializedBytes)
+    sendRequest(socket, 0, serializedBytes)
+
+    // here the socket server should've read only the first request completely and since the response is not sent yet
+    // the selection key should not be readable
+    val request = server.requestChannel.receiveRequest
+    Assert.assertFalse((request.requestKey.asInstanceOf[SelectionKey].interestOps & SelectionKey.OP_READ) == SelectionKey.OP_READ)
+
+    server.requestChannel.sendResponse(new RequestChannel.Response(0, request, null))
+
+    // if everything is working correctly, until you send a response for the first request,
+    // the 2nd request will not be read by the socket server
+    val request2 = server.requestChannel.receiveRequest
+    server.requestChannel.sendResponse(new RequestChannel.Response(0, request2, null))
+    Assert.assertFalse((request.requestKey.asInstanceOf[SelectionKey].interestOps & SelectionKey.OP_READ) == SelectionKey.OP_READ)
+  }
 }
