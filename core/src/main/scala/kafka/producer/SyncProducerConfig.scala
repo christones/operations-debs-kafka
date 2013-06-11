@@ -17,46 +17,31 @@
 
 package kafka.producer
 
+import kafka.utils.Utils
 import java.util.Properties
-import kafka.utils.VerifiableProperties
 
-class SyncProducerConfig private (val props: VerifiableProperties) extends SyncProducerConfigShared {
-  def this(originalProps: Properties) {
-    this(new VerifiableProperties(originalProps))
-    // no need to verify the property since SyncProducerConfig is supposed to be used internally
-  }
-
+class SyncProducerConfig(val props: Properties) extends SyncProducerConfigShared {
   /** the broker to which the producer sends events */
-  val host = props.getString("host")
+  val host = Utils.getString(props, "host")
 
   /** the port on which the broker is running */
-  val port = props.getInt("port")
+  val port = Utils.getInt(props, "port")
 }
 
 trait SyncProducerConfigShared {
-  val props: VerifiableProperties
+  val props: Properties
   
-  val sendBufferBytes = props.getInt("send.buffer.bytes", 100*1024)
+  val bufferSize = Utils.getInt(props, "buffer.size", 100*1024)
 
-  /* the client application sending the producer requests */
-  val clientId = props.getString("client.id", SyncProducerConfig.DefaultClientId)
+  val connectTimeoutMs = Utils.getInt(props, "connect.timeout.ms", 5000)
 
-  /*
-   * The required acks of the producer requests - negative value means ack
-   * after the replicas in ISR have caught up to the leader's offset
-   * corresponding to this produce request.
-   */
-  val requestRequiredAcks = props.getShort("request.required.acks", SyncProducerConfig.DefaultRequiredAcks)
+  /** the socket timeout for network requests */
+  val socketTimeoutMs = Utils.getInt(props, "socket.timeout.ms", 30000)  
 
-  /*
-   * The ack timeout of the producer requests. Value must be non-negative and non-zero
-   */
-  val requestTimeoutMs = props.getIntInRange("request.timeout.ms", SyncProducerConfig.DefaultAckTimeoutMs,
-                                             (1, Integer.MAX_VALUE))
-}
+  val reconnectInterval = Utils.getInt(props, "reconnect.interval", 30000)
 
-object SyncProducerConfig {
-  val DefaultClientId = ""
-  val DefaultRequiredAcks : Short = 0
-  val DefaultAckTimeoutMs = 1500
+  /** negative reconnect time interval means disabling this time-based reconnect feature */
+  var reconnectTimeInterval = Utils.getInt(props, "reconnect.time.interval.ms", 1000*1000*10)
+
+  val maxMessageSize = Utils.getInt(props, "max.message.size", 1000000)
 }

@@ -16,6 +16,7 @@
  */
 package kafka.bridge.pig;
 
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -24,6 +25,8 @@ import kafka.bridge.hadoop.KafkaRecordWriter;
 import org.apache.avro.io.BinaryEncoder;
 import org.apache.avro.io.Encoder;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.OutputFormat;
 import org.apache.hadoop.mapreduce.RecordWriter;
@@ -35,7 +38,7 @@ import org.apache.pig.piggybank.storage.avro.PigSchema2Avro;
 
 public class AvroKafkaStorage extends StoreFunc
 {
-  protected KafkaRecordWriter<Object, byte[]> writer;
+  protected KafkaRecordWriter writer;
   protected org.apache.avro.Schema avroSchema;
   protected PigAvroDatumWriter datumWriter;
   protected Encoder encoder;
@@ -65,7 +68,6 @@ public class AvroKafkaStorage extends StoreFunc
   }
 
   @Override
-  @SuppressWarnings("unchecked")
   public void prepareToWrite(RecordWriter writer) throws IOException
   {
     if (this.avroSchema == null)
@@ -106,7 +108,7 @@ public class AvroKafkaStorage extends StoreFunc
     this.encoder.flush();
 
     try {
-      this.writer.write(null, this.os.toByteArray());
+      this.writer.write(NullWritable.get(), new BytesWritable(this.os.toByteArray()));
     }
     catch (InterruptedException e) {
       throw new IOException(e);

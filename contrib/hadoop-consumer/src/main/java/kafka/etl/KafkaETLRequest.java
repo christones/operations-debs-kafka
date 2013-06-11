@@ -29,7 +29,6 @@ public class KafkaETLRequest {
     URI _uri;
     int _partition;
     long _offset = DEFAULT_OFFSET;
-    String _clientId = "KafkaHadoopETL";
     
     public KafkaETLRequest() {
         
@@ -84,11 +83,11 @@ public class KafkaETLRequest {
         _offset = offset;
     }
     
-    public String getTopic() { return _topic; }
-    public URI getURI () { return _uri; }
-    public int getPartition() { return _partition; }
-    public long getOffset() { return _offset; }
-    public String clientId() { return _clientId; }
+    public String getTopic() { return _topic;}
+    public URI getURI () { return _uri;}
+    public int getPartition() { return _partition;}
+    
+    public long getOffset() { return _offset;}
 
     public boolean isValidOffset() {
         return _offset >= 0;

@@ -16,21 +16,30 @@
 */
 package kafka.producer.async
 
-import kafka.producer.KeyedMessage
+import java.util.Properties
+import kafka.producer.SyncProducer
+import kafka.serializer.Encoder
 
 /**
- * Handler that dispatches the batched data from the queue.
+ * Handler that dispatches the batched data from the queue of the
+ * asynchronous producer.
  */
-trait EventHandler[K,V] {
+trait EventHandler[T] {
+  /**
+   * Initializes the event handler using a Properties object
+   * @param props the properties used to initialize the event handler
+  */
+  def init(props: Properties) {}
 
   /**
    * Callback to dispatch the batched data and send it to a Kafka server
    * @param events the data sent to the producer
+   * @param producer the low-level producer used to send the data
   */
-  def handle(events: Seq[KeyedMessage[K,V]])
+  def handle(events: Seq[QueueItem[T]], producer: SyncProducer, encoder: Encoder[T])
 
   /**
    * Cleans up and shuts down the event handler
   */
-  def close
+  def close {}
 }

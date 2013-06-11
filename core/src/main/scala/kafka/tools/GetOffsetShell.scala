@@ -21,9 +21,6 @@ package kafka.tools
 import kafka.consumer._
 import joptsimple._
 import java.net.URI
-import kafka.api.{PartitionOffsetRequestInfo, OffsetRequest}
-import kafka.common.TopicAndPartition
-
 
 object GetOffsetShell {
 
@@ -67,10 +64,8 @@ object GetOffsetShell {
     val partition = options.valueOf(partitionOpt).intValue
     var time = options.valueOf(timeOpt).longValue
     val nOffsets = options.valueOf(nOffsetsOpt).intValue
-    val consumer = new SimpleConsumer(url.getHost, url.getPort, 10000, 100000, "GetOffsetShell")
-    val topicAndPartition = TopicAndPartition(topic, partition)
-    val request = OffsetRequest(Map(topicAndPartition -> PartitionOffsetRequestInfo(time, nOffsets)))
-    val offsets = consumer.getOffsetsBefore(request).partitionErrorAndOffsets(topicAndPartition).offsets
+    val consumer = new SimpleConsumer(url.getHost, url.getPort, 10000, 100000)
+    val offsets = consumer.getOffsetsBefore(topic, partition, time, nOffsets)
     println("get " + offsets.length + " results")
     for (offset <- offsets)
       println(offset)

@@ -20,15 +20,18 @@ package kafka.tools
 import joptsimple.OptionParser
 import java.util.concurrent.{Executors, CountDownLatch}
 import java.util.Properties
-import kafka.producer.{KeyedMessage, ProducerConfig, Producer}
+import kafka.producer.async.DefaultEventHandler
+import kafka.serializer.DefaultEncoder
+import kafka.producer.{ProducerData, DefaultPartitioner, ProducerConfig, Producer}
 import kafka.consumer._
-import kafka.utils.{Logging, ZkUtils}
+import kafka.utils.{ZKStringSerializer, Logging}
 import kafka.api.OffsetRequest
-import kafka.message.CompressionCodec
+import org.I0Itec.zkclient._
+import kafka.message.{CompressionCodec, Message}
 
 object ReplayLogProducer extends Logging {
 
-  private val GroupId: String = "replay-log-producer"
+  private val GROUPID: String = "replay-log-producer"
 
   def main(args: Array[String]) {
     val config = new Config(args)
@@ -37,17 +40,17 @@ object ReplayLogProducer extends Logging {
     val allDone = new CountDownLatch(config.numThreads)
 
     // if there is no group specified then avoid polluting zookeeper with persistent group data, this is a hack
-    ZkUtils.maybeDeletePath(config.zkConnect, "/consumers/" + GroupId)
+    tryCleanupZookeeper(config.zkConnect, GROUPID)
     Thread.sleep(500)
 
     // consumer properties
     val consumerProps = new Properties
-    consumerProps.put("group.id", GroupId)
+    consumerProps.put("groupid", GROUPID)
     consumerProps.put("zk.connect", config.zkConnect)
     consumerProps.put("consumer.timeout.ms", "10000")
-    consumerProps.put("auto.offset.reset", OffsetRequest.SmallestTimeString)
-    consumerProps.put("fetch.message.max.bytes", (1024*1024).toString)
-    consumerProps.put("socket.receive.buffer.bytes", (2 * 1024 * 1024).toString)
+    consumerProps.put("autooffset.reset", OffsetRequest.SmallestTimeString)
+    consumerProps.put("fetch.size", (1024*1024).toString)
+    consumerProps.put("socket.buffer.size", (2 * 1024 * 1024).toString)
     val consumerConfig = new ConsumerConfig(consumerProps)
     val consumerConnector: ConsumerConnector = Consumer.create(consumerConfig)
     val topicMessageStreams = consumerConnector.createMessageStreams(Predef.Map(config.inputTopic -> config.numThreads))
@@ -71,9 +74,9 @@ object ReplayLogProducer extends Logging {
       .describedAs("zookeeper url")
       .ofType(classOf[String])
       .defaultsTo("127.0.0.1:2181")
-    val brokerListOpt = parser.accepts("broker-list", "REQUIRED: the broker list must be specified.")
+    val brokerInfoOpt = parser.accepts("brokerinfo", "REQUIRED: broker info (either from zookeeper or a list.")
       .withRequiredArg
-      .describedAs("hostname:port")
+      .describedAs("broker.list=brokerid:hostname:port or zk.connect=host:port")
       .ofType(classOf[String])
     val inputTopicOpt = parser.accepts("inputtopic", "REQUIRED: The topic to consume from.")
       .withRequiredArg
@@ -116,7 +119,7 @@ object ReplayLogProducer extends Logging {
       .defaultsTo(0)
 
     val options = parser.parse(args : _*)
-    for(arg <- List(brokerListOpt, inputTopicOpt)) {
+    for(arg <- List(brokerInfoOpt, inputTopicOpt)) {
       if(!options.has(arg)) {
         System.err.println("Missing required argument \"" + arg + "\"")
         parser.printHelpOn(System.err)
@@ -124,7 +127,7 @@ object ReplayLogProducer extends Logging {
       }
     }
     val zkConnect = options.valueOf(zkConnectOpt)
-    val brokerList = options.valueOf(brokerListOpt)
+    val brokerInfo = options.valueOf(brokerInfoOpt)
     val numMessages = options.valueOf(numMessagesOpt).intValue
     val isAsync = options.has(asyncOpt)
     val delayedMSBtwSend = options.valueOf(delayMSBtwBatchOpt).longValue
@@ -136,21 +139,39 @@ object ReplayLogProducer extends Logging {
     val compressionCodec = CompressionCodec.getCompressionCodec(options.valueOf(compressionCodecOption).intValue)
   }
 
-  class ZKConsumerThread(config: Config, stream: KafkaStream[Array[Byte], Array[Byte]]) extends Thread with Logging {
+  def tryCleanupZookeeper(zkUrl: String, groupId: String) {
+    try {
+      val dir = "/consumers/" + groupId
+      info("Cleaning up temporary zookeeper data under " + dir + ".")
+      val zk = new ZkClient(zkUrl, 30*1000, 30*1000, ZKStringSerializer)
+      zk.deleteRecursive(dir)
+      zk.close()
+    } catch {
+      case _ => // swallow
+    }
+  }
+
+  class ZKConsumerThread(config: Config, stream: KafkaStream[Message]) extends Thread with Logging {
     val shutdownLatch = new CountDownLatch(1)
     val props = new Properties()
-    props.put("broker.list", config.brokerList)
+    val brokerInfoList = config.brokerInfo.split("=")
+    if (brokerInfoList(0) == "zk.connect")
+      props.put("zk.connect", brokerInfoList(1))
+    else
+      props.put("broker.list", brokerInfoList(1))
     props.put("reconnect.interval", Integer.MAX_VALUE.toString)
-    props.put("send.buffer.bytes", (64*1024).toString)
+    props.put("buffer.size", (64*1024).toString)
     props.put("compression.codec", config.compressionCodec.codec.toString)
-    props.put("batch.num.messages", config.batchSize.toString)
-    props.put("queue.enqueue.timeout.ms", "-1")
+    props.put("batch.size", config.batchSize.toString)
+    props.put("queue.enqueueTimeout.ms", "-1")
     
     if(config.isAsync)
       props.put("producer.type", "async")
 
     val producerConfig = new ProducerConfig(props)
-    val producer = new Producer[Array[Byte], Array[Byte]](producerConfig)
+    val producer = new Producer[Message, Message](producerConfig, new DefaultEncoder,
+                                                  new DefaultEventHandler[Message](producerConfig, null),
+                                                  null, new DefaultPartitioner[Message])
 
     override def run() {
       info("Starting consumer thread..")
@@ -163,7 +184,7 @@ object ReplayLogProducer extends Logging {
             stream
         for (messageAndMetadata <- iter) {
           try {
-            producer.send(new KeyedMessage[Array[Byte], Array[Byte]](config.outputTopic, messageAndMetadata.message))
+            producer.send(new ProducerData[Message, Message](config.outputTopic, messageAndMetadata.message))
             if (config.delayedMSBtwSend > 0 && (messageCount + 1) % config.batchSize == 0)
               Thread.sleep(config.delayedMSBtwSend)
             messageCount += 1

@@ -28,5 +28,4 @@ public interface KafkaProperties
   final static int reconnectInterval = 10000;
   final static String topic2 = "topic2";
   final static String topic3 = "topic3";
-  final static String clientId = "SimpleConsumerDemoClient";
 }

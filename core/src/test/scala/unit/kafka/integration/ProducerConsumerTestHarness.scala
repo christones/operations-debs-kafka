@@ -19,24 +19,34 @@ package kafka.integration
 
 import kafka.consumer.SimpleConsumer
 import org.scalatest.junit.JUnit3Suite
-import kafka.producer.{ProducerConfig, Producer}
-import kafka.utils.TestUtils
-trait ProducerConsumerTestHarness extends JUnit3Suite with KafkaServerTestHarness {
+import java.util.Properties
+import kafka.producer.{SyncProducerConfig, SyncProducer}
+
+trait ProducerConsumerTestHarness extends JUnit3Suite {
+  
     val port: Int
     val host = "localhost"
-    var producer: Producer[String, String] = null
+    var producer: SyncProducer = null
     var consumer: SimpleConsumer = null
 
-  override def setUp() {
+    override def setUp() {
+      val props = new Properties()
+      props.put("host", host)
+      props.put("port", port.toString)
+      props.put("buffer.size", "65536")
+      props.put("connect.timeout.ms", "100000")
+      props.put("reconnect.interval", "10000")
+      producer = new SyncProducer(new SyncProducerConfig(props))
+      consumer = new SimpleConsumer(host,
+                                   port,
+                                   1000000,
+                                   64*1024)
       super.setUp
-      val props = TestUtils.getProducerConfig(TestUtils.getBrokerListStrFromConfigs(configs), "kafka.utils.StaticPartitioner")
-      producer = new Producer(new ProducerConfig(props))
-      consumer = new SimpleConsumer(host, port, 1000000, 64*1024, "")
     }
 
    override def tearDown() {
+     super.tearDown
      producer.close()
      consumer.close()
-     super.tearDown
    }
 }

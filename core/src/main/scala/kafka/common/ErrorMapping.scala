@@ -20,7 +20,6 @@ package kafka.common
 import kafka.message.InvalidMessageException
 import java.nio.ByteBuffer
 import java.lang.Throwable
-import scala.Predef._
 
 /**
  * A bi-directional mapping between error codes and exceptions x  
@@ -28,46 +27,35 @@ import scala.Predef._
 object ErrorMapping {
   val EmptyByteBuffer = ByteBuffer.allocate(0)
 
-  val UnknownCode : Short = -1
-  val NoError : Short = 0
-  val OffsetOutOfRangeCode : Short = 1
-  val InvalidMessageCode : Short = 2
-  val UnknownTopicOrPartitionCode : Short = 3
-  val InvalidFetchSizeCode  : Short = 4
-  val LeaderNotAvailableCode : Short = 5
-  val NotLeaderForPartitionCode : Short = 6
-  val RequestTimedOutCode: Short = 7
-  val BrokerNotAvailableCode: Short = 8
-  val ReplicaNotAvailableCode: Short = 9
-  val MessageSizeTooLargeCode: Short = 10
-  val StaleControllerEpochCode: Short = 11
-  val OffsetMetadataTooLargeCode: Short = 12
+  val UnknownCode = -1
+  val NoError = 0
+  val OffsetOutOfRangeCode = 1
+  val InvalidMessageCode = 2
+  val WrongPartitionCode = 3
+  val InvalidFetchSizeCode = 4
 
   private val exceptionToCode = 
-    Map[Class[Throwable], Short](
+    Map[Class[Throwable], Int](
       classOf[OffsetOutOfRangeException].asInstanceOf[Class[Throwable]] -> OffsetOutOfRangeCode,
       classOf[InvalidMessageException].asInstanceOf[Class[Throwable]] -> InvalidMessageCode,
-      classOf[UnknownTopicOrPartitionException].asInstanceOf[Class[Throwable]] -> UnknownTopicOrPartitionCode,
-      classOf[InvalidMessageSizeException].asInstanceOf[Class[Throwable]] -> InvalidFetchSizeCode,
-      classOf[NotLeaderForPartitionException].asInstanceOf[Class[Throwable]] -> NotLeaderForPartitionCode,
-      classOf[LeaderNotAvailableException].asInstanceOf[Class[Throwable]] -> LeaderNotAvailableCode,
-      classOf[RequestTimedOutException].asInstanceOf[Class[Throwable]] -> RequestTimedOutCode,
-      classOf[BrokerNotAvailableException].asInstanceOf[Class[Throwable]] -> BrokerNotAvailableCode,
-      classOf[ReplicaNotAvailableException].asInstanceOf[Class[Throwable]] -> ReplicaNotAvailableCode,
-      classOf[MessageSizeTooLargeException].asInstanceOf[Class[Throwable]] -> MessageSizeTooLargeCode,
-      classOf[ControllerMovedException].asInstanceOf[Class[Throwable]] -> StaleControllerEpochCode,
-      classOf[OffsetMetadataTooLargeException].asInstanceOf[Class[Throwable]] -> OffsetMetadataTooLargeCode
+      classOf[InvalidPartitionException].asInstanceOf[Class[Throwable]] -> WrongPartitionCode,
+      classOf[InvalidMessageSizeException].asInstanceOf[Class[Throwable]] -> InvalidFetchSizeCode
     ).withDefaultValue(UnknownCode)
   
   /* invert the mapping */
   private val codeToException = 
-    (Map[Short, Class[Throwable]]() ++ exceptionToCode.iterator.map(p => (p._2, p._1))).withDefaultValue(classOf[UnknownException])
+    (Map[Int, Class[Throwable]]() ++ exceptionToCode.iterator.map(p => (p._2, p._1))).withDefaultValue(classOf[UnknownException])
   
-  def codeFor(exception: Class[Throwable]): Short = exceptionToCode(exception)
+  def codeFor(exception: Class[Throwable]): Int = exceptionToCode(exception)
   
-  def maybeThrowException(code: Short) =
+  def maybeThrowException(code: Int) =
     if(code != 0)
       throw codeToException(code).newInstance()
+}
 
-  def exceptionFor(code: Short) : Throwable = codeToException(code).newInstance()
+class InvalidTopicException(message: String) extends RuntimeException(message) {
+  def this() = this(null)  
+}
+
+class MessageSizeTooLargeException(message: String) extends RuntimeException(message) {
 }

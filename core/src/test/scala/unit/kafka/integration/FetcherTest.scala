@@ -5,7 +5,7 @@
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
- *
+ * 
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package kafka.integration
+package kafka.consumer
 
 import java.util.concurrent._
 import java.util.concurrent.atomic._
@@ -23,78 +23,75 @@ import scala.collection._
 import junit.framework.Assert._
 
 import kafka.cluster._
+import kafka.message._
 import kafka.server._
 import org.scalatest.junit.JUnit3Suite
-import kafka.consumer._
-import kafka.serializer._
-import kafka.producer.{KeyedMessage, Producer}
-import kafka.utils.TestUtils._
+import kafka.integration.KafkaServerTestHarness
 import kafka.utils.TestUtils
-import kafka.admin.AdminUtils
 
 class FetcherTest extends JUnit3Suite with KafkaServerTestHarness {
 
-  val numNodes = 1
-  val configs =
+  val numNodes = 2
+  val configs = 
     for(props <- TestUtils.createBrokerConfigs(numNodes))
-    yield new KafkaConfig(props)
-  val messages = new mutable.HashMap[Int, Seq[Array[Byte]]]
+      yield new KafkaConfig(props) {
+        override val enableZookeeper = false
+      }
+  val messages = new mutable.HashMap[Int, ByteBufferMessageSet]
   val topic = "topic"
-  val cluster = new Cluster(configs.map(c => new Broker(c.brokerId, "localhost", c.port)))
+  val cluster = new Cluster(configs.map(c => new Broker(c.brokerId, c.brokerId.toString, "localhost", c.port)))
   val shutdown = ZookeeperConsumerConnector.shutdownCommand
   val queue = new LinkedBlockingQueue[FetchedDataChunk]
   val topicInfos = configs.map(c => new PartitionTopicInfo(topic,
-                                                           0,
-                                                           queue,
-                                                           new AtomicLong(0),
-                                                           new AtomicLong(0),
-                                                           new AtomicInteger(0),
-                                                           ""))
-
-  var fetcher: ConsumerFetcherManager = null
+                                                      c.brokerId,
+                                                      new Partition(c.brokerId, 0), 
+                                                      queue, 
+                                                      new AtomicLong(0), 
+                                                      new AtomicLong(0), 
+                                                      new AtomicInteger(0)))
+  
+  var fetcher: Fetcher = null
 
   override def setUp() {
     super.setUp
-    AdminUtils.createTopicWithAssignment(zkClient, topic, Map(0 -> Seq(configs.head.brokerId)))
-    waitUntilLeaderIsElectedOrChanged(zkClient, topic, 0, 500)
-    fetcher = new ConsumerFetcherManager("consumer1", new ConsumerConfig(TestUtils.createConsumerProperties("", "", "")), zkClient)
-    fetcher.stopAllConnections()
+    fetcher = new Fetcher(new ConsumerConfig(TestUtils.createConsumerProperties("", "", "")), null)
+    fetcher.stopConnectionsToAllBrokers
     fetcher.startConnections(topicInfos, cluster)
   }
 
   override def tearDown() {
-    fetcher.shutdown()
+    fetcher.stopConnectionsToAllBrokers
     super.tearDown
   }
-
+    
   def testFetcher() {
     val perNode = 2
     var count = sendMessages(perNode)
-
     fetch(count)
+    Thread.sleep(100)
     assertQueueEmpty()
     count = sendMessages(perNode)
     fetch(count)
+    Thread.sleep(100)
     assertQueueEmpty()
   }
-
+  
   def assertQueueEmpty(): Unit = assertEquals(0, queue.size)
-
+  
   def sendMessages(messagesPerNode: Int): Int = {
     var count = 0
     for(conf <- configs) {
-      val producer: Producer[String, Array[Byte]] = TestUtils.createProducer(TestUtils.getBrokerListStrFromConfigs(configs),
-                                                                             new DefaultEncoder(),
-                                                                             new StringEncoder())
-      val ms = 0.until(messagesPerNode).map(x => (conf.brokerId * 5 + x).toString.getBytes).toArray
-      messages += conf.brokerId -> ms
-      producer.send(ms.map(m => KeyedMessage[String, Array[Byte]](topic, topic, m)):_*)
+      val producer = TestUtils.createProducer("localhost", conf.port)
+      val ms = 0.until(messagesPerNode).map(x => new Message((conf.brokerId * 5 + x).toString.getBytes)).toArray
+      val mSet = new ByteBufferMessageSet(compressionCodec = NoCompressionCodec, messages = ms: _*)
+      messages += conf.brokerId -> mSet
+      producer.send(topic, mSet)
       producer.close()
       count += ms.size
     }
     count
   }
-
+  
   def fetch(expected: Int) {
     var count = 0
     while(true) {
@@ -106,5 +103,5 @@ class FetcherTest extends JUnit3Suite with KafkaServerTestHarness {
         return
     }
   }
-
+  
 }

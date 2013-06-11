@@ -17,8 +17,6 @@
 
 package kafka.utils
 
-import java.lang.IllegalStateException
-
 class State
 object DONE extends State
 object READY extends State
@@ -32,21 +30,16 @@ object FAILED extends State
 abstract class IteratorTemplate[T] extends Iterator[T] with java.util.Iterator[T] {
   
   private var state: State = NOT_READY
-  private var nextItem = null.asInstanceOf[T]
+  private var nextItem: Option[T] = None
 
   def next(): T = {
     if(!hasNext())
       throw new NoSuchElementException()
     state = NOT_READY
-    if(nextItem == null)
-      throw new IllegalStateException("Expected item but none found.")
-    nextItem
-  }
-  
-  def peek(): T = {
-    if(!hasNext())
-      throw new NoSuchElementException()
-    nextItem
+    nextItem match {
+      case Some(item) => item
+      case None => throw new IllegalStateException("Expected item but none found.")
+    }
   }
   
   def hasNext(): Boolean = {
@@ -63,7 +56,7 @@ abstract class IteratorTemplate[T] extends Iterator[T] with java.util.Iterator[T
   
   def maybeComputeNext(): Boolean = {
     state = FAILED
-    nextItem = makeNext()
+    nextItem = Some(makeNext())
     if(state == DONE) {
       false
     } else {

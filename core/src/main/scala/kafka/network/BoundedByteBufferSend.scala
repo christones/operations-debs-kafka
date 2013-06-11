@@ -20,7 +20,6 @@ package kafka.network
 import java.nio._
 import java.nio.channels._
 import kafka.utils._
-import kafka.api.RequestOrResponse
 
 @nonthreadsafe
 private[kafka] class BoundedByteBufferSend(val buffer: ByteBuffer) extends Send {
@@ -29,7 +28,7 @@ private[kafka] class BoundedByteBufferSend(val buffer: ByteBuffer) extends Send 
 
   // Avoid possibility of overflow for 2GB-4 byte buffer
   if(buffer.remaining > Int.MaxValue - sizeBuffer.limit)
-    throw new IllegalStateException("Attempt to create a bounded buffer of " + buffer.remaining + " bytes, but the maximum " +
+    throw new IllegalArgumentException("Attempt to create a bounded buffer of " + buffer.remaining + " bytes, but the maximum " +
                                        "allowable size for a bounded buffer is " + (Int.MaxValue - sizeBuffer.limit) + ".")    
   sizeBuffer.putInt(buffer.limit)
   sizeBuffer.rewind()
@@ -38,18 +37,12 @@ private[kafka] class BoundedByteBufferSend(val buffer: ByteBuffer) extends Send 
 
   def this(size: Int) = this(ByteBuffer.allocate(size))
   
-  def this(request: RequestOrResponse) = {
-    this(request.sizeInBytes + (if(request.requestId != None) 2 else 0))
-    request.requestId match {
-      case Some(requestId) =>
-        buffer.putShort(requestId)
-      case None =>
-    }
-
+  def this(request: Request) = {
+    this(request.sizeInBytes + 2)
+    buffer.putShort(request.id)
     request.writeTo(buffer)
     buffer.rewind()
   }
-
   
   def writeTo(channel: GatheringByteChannel): Int = {
     expectIncomplete()

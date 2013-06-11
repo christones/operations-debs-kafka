@@ -25,6 +25,7 @@ import kafka.consumer.ConsumerConfig;
 import kafka.consumer.ConsumerIterator;
 import kafka.consumer.KafkaStream;
 import kafka.javaapi.consumer.ConsumerConnector;
+import kafka.message.Message;
 
 
 public class Consumer extends Thread
@@ -43,10 +44,10 @@ public class Consumer extends Thread
   {
     Properties props = new Properties();
     props.put("zk.connect", KafkaProperties.zkConnect);
-    props.put("group.id", KafkaProperties.groupId);
-    props.put("zk.session.timeout.ms", "400");
-    props.put("zk.sync.time.ms", "200");
-    props.put("auto.commit.interval.ms", "1000");
+    props.put("groupid", KafkaProperties.groupId);
+    props.put("zk.sessiontimeout.ms", "400");
+    props.put("zk.synctime.ms", "200");
+    props.put("autocommit.interval.ms", "1000");
 
     return new ConsumerConfig(props);
 
@@ -55,10 +56,10 @@ public class Consumer extends Thread
   public void run() {
     Map<String, Integer> topicCountMap = new HashMap<String, Integer>();
     topicCountMap.put(topic, new Integer(1));
-    Map<String, List<KafkaStream<byte[], byte[]>>> consumerMap = consumer.createMessageStreams(topicCountMap);
-    KafkaStream<byte[], byte[]> stream =  consumerMap.get(topic).get(0);
-    ConsumerIterator<byte[], byte[]> it = stream.iterator();
+    Map<String, List<KafkaStream<Message>>> consumerMap = consumer.createMessageStreams(topicCountMap);
+    KafkaStream<Message> stream =  consumerMap.get(topic).get(0);
+    ConsumerIterator<Message> it = stream.iterator();
     while(it.hasNext())
-      System.out.println(new String(it.next().message()));
+      System.out.println(ExampleUtils.getMessage(it.next().message()));
   }
 }

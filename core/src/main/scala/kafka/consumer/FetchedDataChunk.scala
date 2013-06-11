@@ -19,6 +19,6 @@ package kafka.consumer
 
 import kafka.message.ByteBufferMessageSet
 
-case class FetchedDataChunk(messages: ByteBufferMessageSet,
-                            topicInfo: PartitionTopicInfo,
-                            fetchOffset: Long)
+private[consumer] class FetchedDataChunk(val messages: ByteBufferMessageSet,
+                                         val topicInfo: PartitionTopicInfo,
+                                         val fetchOffset: Long)

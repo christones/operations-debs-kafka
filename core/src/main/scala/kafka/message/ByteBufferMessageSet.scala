@@ -17,73 +17,11 @@
 
 package kafka.message
 
-import scala.reflect.BeanProperty
 import kafka.utils.Logging
 import java.nio.ByteBuffer
 import java.nio.channels._
-import java.io.{InputStream, ByteArrayOutputStream, DataOutputStream}
-import java.util.concurrent.atomic.AtomicLong
 import kafka.utils.IteratorTemplate
-
-object ByteBufferMessageSet {
-  
-  private def create(offsetCounter: AtomicLong, compressionCodec: CompressionCodec, messages: Message*): ByteBuffer = {
-    if(messages.size == 0) {
-      MessageSet.Empty.buffer
-    } else if(compressionCodec == NoCompressionCodec) {
-      val buffer = ByteBuffer.allocate(MessageSet.messageSetSize(messages))
-      for(message <- messages)
-        writeMessage(buffer, message, offsetCounter.getAndIncrement)
-      buffer.rewind()
-      buffer
-    } else {
-      val byteArrayStream = new ByteArrayOutputStream(MessageSet.messageSetSize(messages))
-      val output = new DataOutputStream(CompressionFactory(compressionCodec, byteArrayStream))
-      var offset = -1L
-      try {
-        for(message <- messages) {
-          offset = offsetCounter.getAndIncrement
-          output.writeLong(offset)
-          output.writeInt(message.size)
-          output.write(message.buffer.array, message.buffer.arrayOffset, message.buffer.limit)
-        }
-      } finally {
-        output.close()
-      }
-      val bytes = byteArrayStream.toByteArray
-      val message = new Message(bytes, compressionCodec)
-      val buffer = ByteBuffer.allocate(message.size + MessageSet.LogOverhead)
-      writeMessage(buffer, message, offset)
-      buffer.rewind()
-      buffer
-    }
-  }
-  
-  def decompress(message: Message): ByteBufferMessageSet = {
-    val outputStream: ByteArrayOutputStream = new ByteArrayOutputStream
-    val inputStream: InputStream = new ByteBufferBackedInputStream(message.payload)
-    val intermediateBuffer = new Array[Byte](1024)
-    val compressed = CompressionFactory(message.compressionCodec, inputStream)
-    try {
-      Stream.continually(compressed.read(intermediateBuffer)).takeWhile(_ > 0).foreach { dataRead =>
-        outputStream.write(intermediateBuffer, 0, dataRead)
-      }
-    } finally {
-      compressed.close()
-    }
-    val outputBuffer = ByteBuffer.allocate(outputStream.size)
-    outputBuffer.put(outputStream.toByteArray)
-    outputBuffer.rewind
-    new ByteBufferMessageSet(outputBuffer)
-  }
-    
-  private[kafka] def writeMessage(buffer: ByteBuffer, message: Message, offset: Long) {
-    buffer.putLong(offset)
-    buffer.putInt(message.size)
-    buffer.put(message.buffer)
-    message.buffer.rewind()
-  }
-}
+import kafka.common.{MessageSizeTooLargeException, InvalidMessageSizeException, ErrorMapping}
 
 /**
  * A sequence of messages stored in a byte buffer
@@ -95,41 +33,47 @@ object ByteBufferMessageSet {
  * Option 2: Give it a list of messages along with instructions relating to serialization format. Producers will use this method.
  * 
  */
-class ByteBufferMessageSet(@BeanProperty val buffer: ByteBuffer) extends MessageSet with Logging {
-  private var shallowValidByteCount = -1
+class ByteBufferMessageSet(private val buffer: ByteBuffer,
+                           private val initialOffset: Long = 0L,
+                           private val errorCode: Int = ErrorMapping.NoError) extends MessageSet with Logging {
+  private var shallowValidByteCount = -1L
+  if(sizeInBytes > Int.MaxValue)
+    throw new InvalidMessageSizeException("Message set cannot be larger than " + Int.MaxValue)
 
   def this(compressionCodec: CompressionCodec, messages: Message*) {
-    this(ByteBufferMessageSet.create(new AtomicLong(0), compressionCodec, messages:_*))
-  }
-  
-  def this(compressionCodec: CompressionCodec, offsetCounter: AtomicLong, messages: Message*) {
-    this(ByteBufferMessageSet.create(offsetCounter, compressionCodec, messages:_*))
+    this(MessageSet.createByteBuffer(compressionCodec, messages:_*), 0L, ErrorMapping.NoError)
   }
 
   def this(messages: Message*) {
-    this(NoCompressionCodec, new AtomicLong(0), messages: _*)
+    this(NoCompressionCodec, messages: _*)
   }
 
-  private def shallowValidBytes: Int = {
+  def getInitialOffset = initialOffset
+
+  def getBuffer = buffer
+
+  def getErrorCode = errorCode
+
+  def serialized(): ByteBuffer = buffer
+
+  def validBytes: Long = shallowValidBytes
+
+  private def shallowValidBytes: Long = {
     if(shallowValidByteCount < 0) {
-      var bytes = 0
       val iter = this.internalIterator(true)
       while(iter.hasNext) {
         val messageAndOffset = iter.next
-        bytes += MessageSet.entrySize(messageAndOffset.message)
+        shallowValidByteCount = messageAndOffset.offset
       }
-      this.shallowValidByteCount = bytes
     }
-    shallowValidByteCount
+    if(shallowValidByteCount < initialOffset) 0
+    else (shallowValidByteCount - initialOffset)
   }
   
   /** Write the messages in this set to the given channel */
-  def writeTo(channel: GatheringByteChannel, offset: Long, size: Int): Int = {
-    // Ignore offset and size from input. We just want to write the whole buffer to the channel.
+  def writeTo(channel: GatheringByteChannel, offset: Long, size: Long): Long = {
     buffer.mark()
-    var written = 0
-    while(written < sizeInBytes)
-      written += channel.write(buffer)
+    val written = channel.write(buffer)
     buffer.reset()
     written
   }
@@ -140,44 +84,72 @@ class ByteBufferMessageSet(@BeanProperty val buffer: ByteBuffer) extends Message
   /** iterator over compressed messages without decompressing */
   def shallowIterator: Iterator[MessageAndOffset] = internalIterator(true)
 
-  /** When flag isShallow is set to be true, we do a shallow iteration: just traverse the first level of messages. **/
+  def verifyMessageSize(maxMessageSize: Int){
+    var shallowIter = internalIterator(true)
+    while(shallowIter.hasNext){
+      var messageAndOffset = shallowIter.next
+      val payloadSize = messageAndOffset.message.payloadSize
+      if ( payloadSize > maxMessageSize)
+        throw new MessageSizeTooLargeException("payload size of " + payloadSize + " larger than " + maxMessageSize)
+    }
+  }
+
+  /** When flag isShallow is set to be true, we do a shallow iteration: just traverse the first level of messages. This is used in verifyMessageSize() function **/
   private def internalIterator(isShallow: Boolean = false): Iterator[MessageAndOffset] = {
+    ErrorMapping.maybeThrowException(errorCode)
     new IteratorTemplate[MessageAndOffset] {
       var topIter = buffer.slice()
-      var innerIter: Iterator[MessageAndOffset] = null
+      var currValidBytes = initialOffset
+      var innerIter:Iterator[MessageAndOffset] = null
+      var lastMessageSize = 0L
 
-      def innerDone():Boolean = (innerIter == null || !innerIter.hasNext)
+      def innerDone():Boolean = (innerIter==null || !innerIter.hasNext)
 
       def makeNextOuter: MessageAndOffset = {
-        // if there isn't at least an offset and size, we are done
-        if (topIter.remaining < 12)
+        if (topIter.remaining < 4) {
           return allDone()
-        val offset = topIter.getLong()
+        }
         val size = topIter.getInt()
-        if(size < 0 || size < Message.MinHeaderSize)
-          throw new InvalidMessageException("Message found with corrupt size (" + size + ")")
-        
-        // we have an incomplete message
-        if(topIter.remaining < size)
+        lastMessageSize = size
+
+        trace("Remaining bytes in iterator = " + topIter.remaining)
+        trace("size of data = " + size)
+
+        if(size < 0 || topIter.remaining < size) {
+          if (currValidBytes == initialOffset || size < 0)
+            throw new InvalidMessageSizeException("invalid message size: " + size + " only received bytes: " +
+              topIter.remaining + " at " + currValidBytes + "( possible causes (1) a single message larger than " +
+              "the fetch size; (2) log corruption )")
           return allDone()
-          
-        // read the current message and check correctness
+        }
         val message = topIter.slice()
         message.limit(size)
         topIter.position(topIter.position + size)
         val newMessage = new Message(message)
+        if(!newMessage.isValid)
+          throw new InvalidMessageException("message is invalid, compression codec: " + newMessage.compressionCodec
+            + " size: " + size + " curr offset: " + currValidBytes + " init offset: " + initialOffset)
 
-        if(isShallow) {
-          new MessageAndOffset(newMessage, offset)
-        } else {
+        if(isShallow){
+          currValidBytes += 4 + size
+          trace("shallow iterator currValidBytes = " + currValidBytes)
+          new MessageAndOffset(newMessage, currValidBytes)
+        }
+        else{
           newMessage.compressionCodec match {
             case NoCompressionCodec =>
+              debug("Message is uncompressed. Valid byte count = %d".format(currValidBytes))
               innerIter = null
-              new MessageAndOffset(newMessage, offset)
+              currValidBytes += 4 + size
+              trace("currValidBytes = " + currValidBytes)
+              new MessageAndOffset(newMessage, currValidBytes)
             case _ =>
-              innerIter = ByteBufferMessageSet.decompress(newMessage).internalIterator()
-              if(!innerIter.hasNext)
+              debug("Message is compressed. Valid byte count = %d".format(currValidBytes))
+              innerIter = CompressionUtils.decompress(newMessage).internalIterator()
+              if (!innerIter.hasNext) {
+                currValidBytes += 4 + lastMessageSize
                 innerIter = null
+              }
               makeNext()
           }
         }
@@ -186,62 +158,46 @@ class ByteBufferMessageSet(@BeanProperty val buffer: ByteBuffer) extends Message
       override def makeNext(): MessageAndOffset = {
         if(isShallow){
           makeNextOuter
-        } else {
-          if(innerDone())
-            makeNextOuter
-          else
-            innerIter.next
+        }
+        else{
+          val isInnerDone = innerDone()
+          debug("makeNext() in internalIterator: innerDone = " + isInnerDone)
+          isInnerDone match {
+            case true => makeNextOuter
+            case false => {
+              val messageAndOffset = innerIter.next
+              if (!innerIter.hasNext)
+                currValidBytes += 4 + lastMessageSize
+              new MessageAndOffset(messageAndOffset.message, currValidBytes)
+            }
+          }
         }
       }
-      
     }
   }
+
+  def sizeInBytes: Long = buffer.limit
   
-  /**
-   * Update the offsets for this message set. This method attempts to do an in-place conversion
-   * if there is no compression, but otherwise recopies the messages
-   */
-  private[kafka] def assignOffsets(offsetCounter: AtomicLong, codec: CompressionCodec): ByteBufferMessageSet = {
-    if(codec == NoCompressionCodec) {
-      // do an in-place conversion
-      var position = 0
-      buffer.mark()
-      while(position < sizeInBytes - MessageSet.LogOverhead) {
-        buffer.position(position)
-        buffer.putLong(offsetCounter.getAndIncrement())
-        position += MessageSet.LogOverhead + buffer.getInt()
-      }
-      buffer.reset()
-      this
-    } else {
-      // messages are compressed, crack open the messageset and recompress with correct offset
-      val messages = this.internalIterator(isShallow = false).map(_.message)
-      new ByteBufferMessageSet(compressionCodec = codec, offsetCounter = offsetCounter, messages = messages.toBuffer:_*)
+  override def toString: String = {
+    val builder = new StringBuilder()
+    builder.append("ByteBufferMessageSet(")
+    for(message <- this) {
+      builder.append(message)
+      builder.append(", ")
     }
+    builder.append(")")
+    builder.toString
   }
- 
 
-  /**
-   * The total number of bytes in this message set, including any partial trailing messages
-   */
-  def sizeInBytes: Int = buffer.limit
-  
-  /**
-   * The total number of bytes in this message set not including any partial, trailing messages
-   */
-  def validBytes: Int = shallowValidBytes
-
-  /**
-   * Two message sets are equal if their respective byte buffers are equal
-   */
   override def equals(other: Any): Boolean = {
     other match {
-      case that: ByteBufferMessageSet => 
-        buffer.equals(that.buffer)
+      case that: ByteBufferMessageSet =>
+        (that canEqual this) && errorCode == that.errorCode && buffer.equals(that.buffer) && initialOffset == that.initialOffset
       case _ => false
     }
   }
 
-  override def hashCode: Int = buffer.hashCode
+  override def canEqual(other: Any): Boolean = other.isInstanceOf[ByteBufferMessageSet]
 
+  override def hashCode: Int = 31 + (17 * errorCode) + buffer.hashCode + initialOffset.hashCode
 }

@@ -41,8 +41,6 @@ Mapper<KafkaETLKey, BytesWritable, LongWritable, Text> {
     
 	protected Text getData(Message message) throws IOException {
 		ByteBuffer buf = message.payload();
-		if(buf == null)
-		  return new Text();
 		
 		byte[] array = new byte[buf.limit()];
 		buf.get(array);

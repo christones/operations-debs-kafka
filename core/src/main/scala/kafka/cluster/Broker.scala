@@ -17,59 +17,24 @@
 
 package kafka.cluster
 
-import kafka.utils.Utils._
-import kafka.utils.Json
-import kafka.api.ApiUtils._
-import java.nio.ByteBuffer
-import kafka.common.{KafkaException, BrokerNotAvailableException}
+import kafka.utils._
 
 /**
  * A Kafka broker
  */
 private[kafka] object Broker {
-
   def createBroker(id: Int, brokerInfoString: String): Broker = {
-    if(brokerInfoString == null)
-      throw new BrokerNotAvailableException("Broker id %s does not exist".format(id))
-    try {
-      Json.parseFull(brokerInfoString) match {
-        case Some(m) =>
-          val brokerInfo = m.asInstanceOf[Map[String, Any]]
-          val host = brokerInfo.get("host").get.asInstanceOf[String]
-          val port = brokerInfo.get("port").get.asInstanceOf[Int]
-          new Broker(id, host, port)
-        case None =>
-          throw new BrokerNotAvailableException("Broker id %d does not exist".format(id))
-      }
-    } catch {
-      case t => throw new KafkaException("Failed to parse the broker info from zookeeper: " + brokerInfoString, t)
-    }
-  }
-
-  def readFrom(buffer: ByteBuffer): Broker = {
-    val id = buffer.getInt
-    val host = readShortString(buffer)
-    val port = buffer.getInt
-    new Broker(id, host, port)
+    val brokerInfo = brokerInfoString.split(":")
+    new Broker(id, brokerInfo(0), brokerInfo(1), brokerInfo(2).toInt)
   }
 }
 
-private[kafka] case class Broker(val id: Int, val host: String, val port: Int) {
+private[kafka] class Broker(val id: Int, val creatorId: String, val host: String, val port: Int) {
   
-  override def toString(): String = new String("id:" + id + ",host:" + host + ",port:" + port)
+  override def toString(): String = new String("id:" + id + ",creatorId:" + creatorId + ",host:" + host + ",port:" + port)
 
-  def getZkString(): String = host + ":" + port
-
-  def getConnectionString(): String = host + ":" + port
-
-  def writeTo(buffer: ByteBuffer) {
-    buffer.putInt(id)
-    writeShortString(buffer, host)
-    buffer.putInt(port)
-  }
-
-  def sizeInBytes: Int = shortStringLength(host) /* host name */ + 4 /* port */ + 4 /* broker id*/
-
+  def getZKString(): String = new String(creatorId + ":" + host + ":" + port)
+  
   override def equals(obj: Any): Boolean = {
     obj match {
       case null => false
@@ -78,6 +43,6 @@ private[kafka] case class Broker(val id: Int, val host: String, val port: Int) {
     }
   }
   
-  override def hashCode(): Int = hashcode(id, host, port)
+  override def hashCode(): Int = Utils.hashcode(id, host, port)
   
 }

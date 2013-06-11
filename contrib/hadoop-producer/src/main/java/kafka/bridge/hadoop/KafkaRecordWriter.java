@@ -16,58 +16,49 @@
  */
 package kafka.bridge.hadoop;
 
+
 import java.io.IOException;
 import java.util.LinkedList;
 import java.util.List;
 import kafka.javaapi.producer.Producer;
-import kafka.producer.KeyedMessage;
+import kafka.javaapi.producer.ProducerData;
+import kafka.message.Message;
 import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.mapreduce.RecordWriter;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 
-public class KafkaRecordWriter<K,V> extends RecordWriter<K,V>
+public class KafkaRecordWriter<W extends BytesWritable> extends RecordWriter<NullWritable, W>
 {
-  protected Producer<Object, byte[]> producer;
+  protected Producer<Integer, Message> producer;
   protected String topic;
 
-  protected List<KeyedMessage<Object, byte[]>> msgList = new LinkedList<KeyedMessage<Object, byte[]>>();
+  protected List<ProducerData<Integer, Message>> msgList = new LinkedList<ProducerData<Integer, Message>>();
   protected int totalSize = 0;
   protected int queueSize;
 
-  public KafkaRecordWriter(Producer<Object, byte[]> producer, String topic, int queueSize)
+  public KafkaRecordWriter(Producer<Integer, Message> producer, String topic, int queueSize)
   {
     this.producer = producer;
     this.topic = topic;
     this.queueSize = queueSize;
   }
 
-  protected void sendMsgList() throws IOException
+  protected void sendMsgList()
   {
     if (msgList.size() > 0) {
-      try {
-        producer.send(msgList);
-      }
-      catch (Exception e) {
-        throw new IOException(e);           // all Kafka exceptions become IOExceptions
-      }
+      producer.send(msgList);
       msgList.clear();
       totalSize = 0;
     }
   }
 
   @Override
-  public void write(K key, V value) throws IOException, InterruptedException
+  public void write(NullWritable key, BytesWritable value) throws IOException, InterruptedException
   {
-    byte[] valBytes;
-    if (value instanceof byte[])
-      valBytes = (byte[]) value;
-    else if (value instanceof BytesWritable)
-      valBytes = ((BytesWritable) value).getBytes();
-    else
-      throw new IllegalArgumentException("KafkaRecordWriter expects byte array value to publish");
-
-    msgList.add(new KeyedMessage<Object, byte[]>(this.topic, key, valBytes));
-    totalSize += valBytes.length;
+    Message msg = new Message(value.getBytes());
+    msgList.add(new ProducerData<Integer, Message>(this.topic, msg));
+    totalSize += msg.size();
 
     // MultiProducerRequest only supports sending up to Short.MAX_VALUE messages in one batch
     if (totalSize > queueSize || msgList.size() >= Short.MAX_VALUE)

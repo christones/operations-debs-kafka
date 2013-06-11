@@ -26,15 +26,13 @@ import kafka.utils.Utils
 class EmbeddedZookeeper(val connectString: String) {
   val snapshotDir = TestUtils.tempDir()
   val logDir = TestUtils.tempDir()
-  val tickTime = 500
-  val zookeeper = new ZooKeeperServer(snapshotDir, logDir, tickTime)
+  val zookeeper = new ZooKeeperServer(snapshotDir, logDir, 3000)
   val port = connectString.split(":")(1).toInt
   val factory = new NIOServerCnxn.Factory(new InetSocketAddress("127.0.0.1", port))
   factory.startup(zookeeper)
 
   def shutdown() {
-    Utils.swallow(zookeeper.shutdown())
-    Utils.swallow(factory.shutdown())
+    factory.shutdown()
     Utils.rm(logDir)
     Utils.rm(snapshotDir)
   }

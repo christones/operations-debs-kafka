@@ -16,7 +16,8 @@
  */
 package kafka.javaapi.consumer
 
-import kafka.serializer._
+import kafka.message.Message
+import kafka.serializer.{DefaultDecoder, Decoder}
 import kafka.consumer._
 import scala.collection.JavaConversions.asList
 
@@ -58,45 +59,46 @@ import scala.collection.JavaConversions.asList
 */
 
 private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
-                                                val enableFetcher: Boolean) // for testing only
+                                 val enableFetcher: Boolean) // for testing only
     extends ConsumerConnector {
 
-  private val underlying = new kafka.consumer.ZookeeperConsumerConnector(config, enableFetcher)
+  val underlying = new kafka.consumer.ZookeeperConsumerConnector(config, enableFetcher)
 
   def this(config: ConsumerConfig) = this(config, true)
 
  // for java client
-  def createMessageStreams[K,V](
+  def createMessageStreams[T](
         topicCountMap: java.util.Map[String,java.lang.Integer],
-        keyDecoder: Decoder[K],
-        valueDecoder: Decoder[V])
-      : java.util.Map[String,java.util.List[KafkaStream[K,V]]] = {
+        decoder: Decoder[T])
+      : java.util.Map[String,java.util.List[KafkaStream[T]]] = {
     import scala.collection.JavaConversions._
 
     val scalaTopicCountMap: Map[String, Int] = Map.empty[String, Int] ++ asMap(topicCountMap.asInstanceOf[java.util.Map[String, Int]])
-    val scalaReturn = underlying.consume(scalaTopicCountMap, keyDecoder, valueDecoder)
-    val ret = new java.util.HashMap[String,java.util.List[KafkaStream[K,V]]]
+    val scalaReturn = underlying.consume(scalaTopicCountMap, decoder)
+    val ret = new java.util.HashMap[String,java.util.List[KafkaStream[T]]]
     for ((topic, streams) <- scalaReturn) {
-      var javaStreamList = new java.util.ArrayList[KafkaStream[K,V]]
+      var javaStreamList = new java.util.ArrayList[KafkaStream[T]]
       for (stream <- streams)
         javaStreamList.add(stream)
       ret.put(topic, javaStreamList)
     }
     ret
   }
-  
-  def createMessageStreams(topicCountMap: java.util.Map[String,java.lang.Integer]): java.util.Map[String,java.util.List[KafkaStream[Array[Byte],Array[Byte]]]] =
-    createMessageStreams(topicCountMap, new DefaultDecoder(), new DefaultDecoder())
-    
-  def createMessageStreamsByFilter[K,V](topicFilter: TopicFilter, numStreams: Int, keyDecoder: Decoder[K], valueDecoder: Decoder[V]) =
-    asList(underlying.createMessageStreamsByFilter(topicFilter, numStreams, keyDecoder, valueDecoder))
 
-  def createMessageStreamsByFilter(topicFilter: TopicFilter, numStreams: Int) = 
-    createMessageStreamsByFilter(topicFilter, numStreams, new DefaultDecoder(), new DefaultDecoder())
-    
-  def createMessageStreamsByFilter(topicFilter: TopicFilter) = 
-    createMessageStreamsByFilter(topicFilter, 1, new DefaultDecoder(), new DefaultDecoder())
-    
+  def createMessageStreams(
+        topicCountMap: java.util.Map[String,java.lang.Integer])
+      : java.util.Map[String,java.util.List[KafkaStream[Message]]] =
+    createMessageStreams(topicCountMap, new DefaultDecoder)
+
+  def createMessageStreamsByFilter[T](topicFilter: TopicFilter, numStreams: Int, decoder: Decoder[T]) =
+    asList(underlying.createMessageStreamsByFilter(topicFilter, numStreams, decoder))
+
+  def createMessageStreamsByFilter(topicFilter: TopicFilter, numStreams: Int) =
+    createMessageStreamsByFilter(topicFilter, numStreams, new DefaultDecoder)
+
+  def createMessageStreamsByFilter(topicFilter: TopicFilter) =
+    createMessageStreamsByFilter(topicFilter, 1, new DefaultDecoder)
+
   def commitOffsets() {
     underlying.commitOffsets
   }

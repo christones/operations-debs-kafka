@@ -17,76 +17,52 @@
 
 package kafka.producer
 
-import async.AsyncProducerConfig
+import async.AsyncProducerConfigShared
 import java.util.Properties
-import kafka.utils.{Utils, VerifiableProperties}
-import kafka.message.{CompressionCodec, NoCompressionCodec}
-import kafka.common.{InvalidConfigException, Config}
+import kafka.utils.{ZKConfig, Utils}
+import kafka.common.InvalidConfigException
 
-object ProducerConfig extends Config {
-  def validate(config: ProducerConfig) {
-    validateClientId(config.clientId)
-    validateBatchSize(config.batchNumMessages, config.queueBufferingMaxMessages)
-    validateProducerType(config.producerType)
-  }
+class ProducerConfig(val props: Properties) extends ZKConfig(props)
+        with AsyncProducerConfigShared with SyncProducerConfigShared{
 
-  def validateClientId(clientId: String) {
-    validateChars("client.id", clientId)
-  }
+  /** For bypassing zookeeper based auto partition discovery, use this config   *
+   *  to pass in static broker and per-broker partition information. Format-    *
+   *  brokerid1:host1:port1, brokerid2:host2:port2*/
+  val brokerList = Utils.getString(props, "broker.list", null)
+  if(Utils.propertyExists(brokerList) && Utils.getString(props, "partitioner.class", null) != null)
+    throw new InvalidConfigException("partitioner.class cannot be used when broker.list is set")
 
-  def validateBatchSize(batchSize: Int, queueSize: Int) {
-    if (batchSize > queueSize)
-      throw new InvalidConfigException("Batch size = " + batchSize + " can't be larger than queue size = " + queueSize)
-  }
-
-  def validateProducerType(producerType: String) {
-    producerType match {
-      case "sync" =>
-      case "async"=>
-      case _ => throw new InvalidConfigException("Invalid value " + producerType + " for producer.type, valid values are sync/async")
-    }
-  }
-}
-
-class ProducerConfig private (val props: VerifiableProperties)
-        extends AsyncProducerConfig with SyncProducerConfigShared {
-  import ProducerConfig._
-
-  def this(originalProps: Properties) {
-    this(new VerifiableProperties(originalProps))
-    props.verify()
-  }
-
-  /** This is for bootstrapping and the producer will only use it for getting metadata
-   * (topics, partitions and replicas). The socket connections for sending the actual data
-   * will be established based on the broker information returned in the metadata. The
-   * format is host1:port1,host2:port2, and the list can be a subset of brokers or
-   * a VIP pointing to a subset of brokers.
+  /**
+   * If DefaultEventHandler is used, this specifies the number of times to
+   * retry if an error is encountered during send. Currently, it is only
+   * appropriate when broker.list points to a VIP. If the zk.connect option
+   * is used instead, this will not have any effect because with the zk-based
+   * producer, brokers are not re-selected upon retry. So retries would go to
+   * the same (potentially still down) broker. (KAFKA-253 will help address
+   * this.)
    */
-  val brokerList = props.getString("broker.list")
+  val numRetries = Utils.getInt(props, "num.retries", 0)
+
+  /** If both broker.list and zk.connect options are specified, throw an exception */
+  if(Utils.propertyExists(brokerList) && Utils.propertyExists(zkConnect))
+    throw new InvalidConfigException("only one of broker.list and zk.connect can be specified")
+
+  if(!Utils.propertyExists(zkConnect) && !Utils.propertyExists(brokerList))
+    throw new InvalidConfigException("At least one of zk.connect or broker.list must be specified")
 
   /** the partitioner class for partitioning events amongst sub-topics */
-  val partitionerClass = props.getString("partitioner.class", "kafka.producer.DefaultPartitioner")
+  val partitionerClass = Utils.getString(props, "partitioner.class", "kafka.producer.DefaultPartitioner")
 
   /** this parameter specifies whether the messages are sent asynchronously *
    * or not. Valid values are - async for asynchronous send                 *
    *                            sync for synchronous send                   */
-  val producerType = props.getString("producer.type", "sync")
+  val producerType = Utils.getString(props, "producer.type", "sync")
 
   /**
    * This parameter allows you to specify the compression codec for all data generated *
    * by this producer. The default is NoCompressionCodec
    */
-  val compressionCodec = {
-    val prop = props.getString("compression.codec", NoCompressionCodec.name)
-    try {
-      CompressionCodec.getCompressionCodec(prop.toInt)
-    }
-    catch {
-      case nfe: NumberFormatException =>
-        CompressionCodec.getCompressionCodec(prop)
-    }
-  }
+  val compressionCodec = Utils.getCompressionCodec(props, "compression.codec")
 
   /** This parameter allows you to set whether compression should be turned *
    *  on for particular topics
@@ -99,28 +75,15 @@ class ProducerConfig private (val props: VerifiableProperties)
    *
    *  If the compression codec is NoCompressionCodec, compression is disabled for all topics
    */
-  val compressedTopics = Utils.parseCsvList(props.getString("compressed.topics", null))
-
-  /** The leader may be unavailable transiently, which can fail the sending of a message.
-    *  This property specifies the number of retries when such failures occur.
-    */
-  val messageSendMaxRetries = props.getInt("message.send.max.retries", 3)
-
-  /** Before each retry, the producer refreshes the metadata of relevant topics. Since leader
-    * election takes a bit of time, this property specifies the amount of time that the producer
-    * waits before refreshing the metadata.
-    */
-  val retryBackoffMs = props.getInt("retry.backoff.ms", 100)
+  val compressedTopics = Utils.getCSVList(Utils.getString(props, "compressed.topics", null))
 
   /**
-   * The producer generally refreshes the topic metadata from brokers when there is a failure
-   * (partition missing, leader not available...). It will also poll regularly (default: every 10min
-   * so 600000ms). If you set this to a negative value, metadata will only get refreshed on failure.
-   * If you set this to zero, the metadata will get refreshed after each message sent (not recommended)
-   * Important note: the refresh happen only AFTER the message is sent, so if the producer never sends
-   * a message the metadata is never refreshed
+   * The producer using the zookeeper software load balancer maintains a ZK cache that gets
+   * updated by the zookeeper watcher listeners. During some events like a broker bounce, the
+   * producer ZK cache can get into an inconsistent state, for a small time period. In this time
+   * period, it could end up picking a broker partition that is unavailable. When this happens, the
+   * ZK cache needs to be updated.
+   * This parameter specifies the number of times the producer attempts to refresh this ZK cache.
    */
-  val topicMetadataRefreshIntervalMs = props.getInt("topic.metadata.refresh.interval.ms", 600000)
-
-  validate(this)
+  val zkReadRetries = Utils.getInt(props, "zk.read.num.retries", 3)
 }

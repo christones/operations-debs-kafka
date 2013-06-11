@@ -18,8 +18,9 @@
 package kafka.javaapi.consumer
 
 import kafka.utils.threadsafe
-import kafka.javaapi.FetchResponse
-import kafka.javaapi.OffsetRequest
+import kafka.javaapi.message.ByteBufferMessageSet
+import kafka.javaapi.MultiFetchResponse
+import kafka.api.FetchRequest
 
 /**
  * A consumer of kafka messages
@@ -28,76 +29,41 @@ import kafka.javaapi.OffsetRequest
 class SimpleConsumer(val host: String,
                      val port: Int,
                      val soTimeout: Int,
-                     val bufferSize: Int,
-                     val clientId: String) {
-
-  private val underlying = new kafka.consumer.SimpleConsumer(host, port, soTimeout, bufferSize, clientId)
+                     val bufferSize: Int) {
+  val underlying = new kafka.consumer.SimpleConsumer(host, port, soTimeout, bufferSize)
 
   /**
-   *  Fetch a set of messages from a topic. This version of the fetch method
-   *  takes the Scala version of a fetch request (i.e.,
-   *  [[kafka.api.FetchRequest]] and is intended for use with the
-   *  [[kafka.api.FetchRequestBuilder]].
+   *  Fetch a set of messages from a topic.
    *
    *  @param request  specifies the topic name, topic partition, starting byte offset, maximum bytes to be fetched.
    *  @return a set of fetched messages
    */
-  def fetch(request: kafka.api.FetchRequest): FetchResponse = {
+  def fetch(request: FetchRequest): ByteBufferMessageSet = {
     import kafka.javaapi.Implicits._
     underlying.fetch(request)
   }
-  
-  /**
-   *  Fetch a set of messages from a topic.
-   *
-   *  @param request specifies the topic name, topic partition, starting byte offset, maximum bytes to be fetched.
-   *  @return a set of fetched messages
-   */
-  def fetch(request: kafka.javaapi.FetchRequest): FetchResponse = {
-    fetch(request.underlying)
-  }
 
   /**
-   *  Fetch metadata for a sequence of topics.
-   *  
-   *  @param request specifies the versionId, clientId, sequence of topics.
-   *  @return metadata for each topic in the request.
+   *  Combine multiple fetch requests in one call.
+   *
+   *  @param fetches  a sequence of fetch requests.
+   *  @return a sequence of fetch responses
    */
-  def send(request: kafka.javaapi.TopicMetadataRequest): kafka.javaapi.TopicMetadataResponse = {
+  def multifetch(fetches: java.util.List[FetchRequest]): MultiFetchResponse = {
+    import scala.collection.JavaConversions._
     import kafka.javaapi.Implicits._
-    underlying.send(request.underlying)
+    underlying.multifetch(asBuffer(fetches): _*)
   }
 
   /**
    *  Get a list of valid offsets (up to maxSize) before the given time.
+   *  The result is a list of offsets, in descending order.
    *
-   *  @param request a [[kafka.javaapi.OffsetRequest]] object.
-   *  @return a [[kafka.javaapi.OffsetResponse]] object.
+   *  @param time: time in millisecs (-1, from the latest offset available, -2 from the smallest offset available)
+   *  @return an array of offsets
    */
-  def getOffsetsBefore(request: OffsetRequest): kafka.javaapi.OffsetResponse = {
-    import kafka.javaapi.Implicits._
-    underlying.getOffsetsBefore(request.underlying)
-  }
-
-  /**
-   * Commit offsets for a topic
-   * @param request a [[kafka.javaapi.OffsetCommitRequest]] object.
-   * @return a [[kafka.javaapi.OffsetCommitResponse]] object.
-   */
-  def commitOffsets(request: kafka.javaapi.OffsetCommitRequest): kafka.javaapi.OffsetCommitResponse = {
-    import kafka.javaapi.Implicits._
-    underlying.commitOffsets(request.underlying)
-  }
-
-  /**
-   * Fetch offsets for a topic
-   * @param request a [[kafka.javaapi.OffsetFetchRequest]] object.
-   * @return a [[kafka.javaapi.OffsetFetchResponse]] object.
-   */
-  def fetchOffsets(request: kafka.javaapi.OffsetFetchRequest): kafka.javaapi.OffsetFetchResponse = {
-    import kafka.javaapi.Implicits._
-    underlying.fetchOffsets(request.underlying)
-  }
+  def getOffsetsBefore(topic: String, partition: Int, time: Long, maxNumOffsets: Int): Array[Long] =
+    underlying.getOffsetsBefore(topic, partition, time, maxNumOffsets)
 
   def close() {
     underlying.close

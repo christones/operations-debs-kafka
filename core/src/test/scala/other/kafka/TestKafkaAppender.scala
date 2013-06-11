@@ -17,6 +17,7 @@
 
 package kafka
 
+import message.Message
 import org.apache.log4j.PropertyConfigurator
 import kafka.utils.Logging
 import serializer.Encoder
@@ -43,7 +44,7 @@ object TestKafkaAppender extends Logging {
   }
 }
 
-class AppenderStringSerializer(encoding: String = "UTF-8") extends Encoder[AnyRef] {
-  def toBytes(event: AnyRef): Array[Byte] = event.toString.getBytes(encoding)
+class AppenderStringSerializer extends Encoder[AnyRef] {
+  def toMessage(event: AnyRef):Message = new Message(event.asInstanceOf[String].getBytes)
 }
 

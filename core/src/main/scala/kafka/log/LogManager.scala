@@ -5,7 +5,7 @@
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
- *
+ * 
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
@@ -18,228 +18,236 @@
 package kafka.log
 
 import java.io._
-import java.util.concurrent.TimeUnit
 import kafka.utils._
+import scala.actors.Actor
 import scala.collection._
-import kafka.common.{TopicAndPartition, KafkaException}
-import kafka.server.KafkaConfig
-
+import java.util.concurrent.CountDownLatch
+import kafka.server.{KafkaConfig, KafkaZooKeeper}
+import kafka.common.{InvalidTopicException, InvalidPartitionException}
+import kafka.api.OffsetRequest
 
 /**
- * The entry point to the kafka log management subsystem. The log manager is responsible for log creation, retrieval, and cleaning.
- * All read and write operations are delegated to the individual log instances.
- * 
- * The log manager maintains logs in one or more directories. New logs are created in the data directory
- * with the fewest logs. No attempt is made to move partitions after the fact or balance based on
- * size or I/O rate.
- * 
- * A background thread handles log retention by periodically truncating excess log segments.
+ * The guy who creates and hands out logs
  */
 @threadsafe
-class LogManager(val logDirs: Array[File],
-                 val topicConfigs: Map[String, LogConfig],
-                 val defaultConfig: LogConfig,
-                 val cleanerConfig: CleanerConfig,
-                 val flushCheckMs: Long,
-                 val retentionCheckMs: Long,
-                 scheduler: Scheduler,
-                 private val time: Time) extends Logging {
+private[kafka] class LogManager(val config: KafkaConfig,
+                                private val scheduler: KafkaScheduler,
+                                private val time: Time,
+                                val logRollDefaultIntervalMs: Long,
+                                val logCleanupIntervalMs: Long,
+                                val logCleanupDefaultAgeMs: Long,
+                                needRecovery: Boolean) extends Logging {
 
-  val CleanShutdownFile = ".kafka_cleanshutdown"
-  val LockFile = ".lock"
-  val InitialTaskDelayMs = 30*1000
+  val logDir: File = new File(config.logDir)
+  private val numPartitions = config.numPartitions
+  private val logFileSizeMap = config.logFileSizeMap
+  private val flushInterval = config.flushInterval
+  private val topicPartitionsMap = config.topicPartitionsMap
   private val logCreationLock = new Object
-  private val logs = new Pool[TopicAndPartition, Log]()
-  
-  createAndValidateLogDirs(logDirs)
-  private var dirLocks = lockLogDirs(logDirs)
-  loadLogs(logDirs)
-  
-  private val cleaner: LogCleaner = 
-    if(cleanerConfig.enableCleaner)
-      new LogCleaner(cleanerConfig, logDirs, logs, time = time)
-    else
-      null
-  
-  /**
-   * Create and check validity of the given directories, specifically:
-   * <ol>
-   * <li> Ensure that there are no duplicates in the directory list
-   * <li> Create each directory if it doesn't exist
-   * <li> Check that each path is a readable directory 
-   * </ol>
-   */
-  private def createAndValidateLogDirs(dirs: Seq[File]) {
-    if(dirs.map(_.getCanonicalPath).toSet.size < dirs.size)
-      throw new KafkaException("Duplicate log directory found: " + logDirs.mkString(", "))
-    for(dir <- dirs) {
-      if(!dir.exists) {
-        info("Log directory '" + dir.getAbsolutePath + "' not found, creating it.")
-        val created = dir.mkdirs()
-        if(!created)
-          throw new KafkaException("Failed to create data directory " + dir.getAbsolutePath)
+  private val random = new java.util.Random
+  private var kafkaZookeeper: KafkaZooKeeper = null
+  private var zkActor: Actor = null
+  private val startupLatch: CountDownLatch = if (config.enableZookeeper) new CountDownLatch(1) else null
+  private val logFlusherScheduler = new KafkaScheduler(1, "kafka-logflusher-", false)
+  private val topicNameValidator = new TopicNameValidator(config)
+  private val logFlushIntervalMap = config.flushIntervalMap
+  private val logRetentionSizeMap = config.logRetentionSizeMap
+  private val logRetentionMsMap = getMsMap(config.logRetentionHoursMap)
+  private val logRollMsMap = getMsMap(config.logRollHoursMap)
+
+  /* Initialize a log for each subdirectory of the main log directory */
+  private val logs = new Pool[String, Pool[Int, Log]]()
+  if(!logDir.exists()) {
+    info("No log directory found, creating '" + logDir.getAbsolutePath() + "'")
+    logDir.mkdirs()
+  }
+  if(!logDir.isDirectory() || !logDir.canRead())
+    throw new IllegalArgumentException(logDir.getAbsolutePath() + " is not a readable log directory.")
+  val subDirs = logDir.listFiles()
+  if(subDirs != null) {
+    for(dir <- subDirs) {
+      if(!dir.isDirectory()) {
+        warn("Skipping unexplainable file '" + dir.getAbsolutePath() + "'--should it be there?")
+      } else {
+        info("Loading log '" + dir.getName() + "'")
+        val topic = Utils.getTopicPartition(dir.getName)._1
+        val rollIntervalMs = logRollMsMap.get(topic).getOrElse(this.logRollDefaultIntervalMs)
+        val maxLogFileSize = logFileSizeMap.get(topic).getOrElse(config.logFileSize)
+        val log = new Log(dir, time, maxLogFileSize, config.maxMessageSize, flushInterval, rollIntervalMs, needRecovery)
+        val topicPartion = Utils.getTopicPartition(dir.getName)
+        logs.putIfNotExists(topicPartion._1, new Pool[Int, Log]())
+        val parts = logs.get(topicPartion._1)
+        parts.put(topicPartion._2, log)
       }
-      if(!dir.isDirectory || !dir.canRead)
-        throw new KafkaException(dir.getAbsolutePath + " is not a readable log directory.")
     }
   }
   
-  /**
-   * Lock all the given directories
-   */
-  private def lockLogDirs(dirs: Seq[File]): Seq[FileLock] = {
-    dirs.map { dir =>
-      val lock = new FileLock(new File(dir, LockFile))
-      if(!lock.tryLock())
-        throw new KafkaException("Failed to acquire lock on file .lock in " + lock.file.getParentFile.getAbsolutePath + 
-                               ". A Kafka instance in another process or thread is using this directory.")
-      lock
-    }
+  /* Schedule the cleanup task to delete old logs */
+  if(scheduler != null) {
+    info("starting log cleaner every " + logCleanupIntervalMs + " ms")    
+    scheduler.scheduleWithRate(cleanupLogs, 60 * 1000, logCleanupIntervalMs)
   }
-  
-  /**
-   * Recover and load all logs in the given data directories
-   */
-  private def loadLogs(dirs: Seq[File]) {
-    for(dir <- dirs) {
-      /* check if this set of logs was shut down cleanly */
-      val cleanShutDownFile = new File(dir, CleanShutdownFile)
-      val needsRecovery = !cleanShutDownFile.exists
-      cleanShutDownFile.delete
-      /* load the logs */
-      val subDirs = dir.listFiles()
-      if(subDirs != null) {
-        for(dir <- subDirs) {
-          if(dir.isDirectory){
-            info("Loading log '" + dir.getName + "'")
-            val topicPartition = parseTopicPartitionName(dir.getName)
-            val config = topicConfigs.getOrElse(topicPartition.topic, defaultConfig)
-            val log = new Log(dir, 
-                              config,
-                              needsRecovery,
-                              scheduler,
-                              time)
-            val previous = this.logs.put(topicPartition, log)
-            if(previous != null)
-              throw new IllegalArgumentException("Duplicate log directories found: %s, %s!".format(log.dir.getAbsolutePath, previous.dir.getAbsolutePath))
+
+  if(config.enableZookeeper) {
+    kafkaZookeeper = new KafkaZooKeeper(config, this)
+    kafkaZookeeper.startup
+    zkActor = new Actor {
+      def act() {
+        loop {
+          receive {
+            case topic: String =>
+              try {
+                kafkaZookeeper.registerTopicInZk(topic)
+              }
+              catch {
+                case e => error(e) // log it and let it go
+              }
+            case StopActor =>
+              info("zkActor stopped")
+              exit
           }
         }
       }
     }
+    zkActor.start
+  }
+
+  case object StopActor
+
+  private def getMsMap(hoursMap: Map[String, Int]) : Map[String, Long] = {
+    var ret = new mutable.HashMap[String, Long]
+    for ( (topic, hour) <- hoursMap ) {
+      ret.put(topic, hour * 60 * 60 * 1000L)
+    }
+    ret
   }
 
   /**
-   *  Start the background threads to flush logs and do log cleanup
+   *  Register this broker in ZK for the first time.
    */
   def startup() {
-    /* Schedule the cleanup task to delete old logs */
-    if(scheduler != null) {
-      info("Starting log cleanup with a period of %d ms.".format(retentionCheckMs))
-      scheduler.schedule("kafka-log-retention", 
-                         cleanupLogs, 
-                         delay = InitialTaskDelayMs, 
-                         period = retentionCheckMs, 
-                         TimeUnit.MILLISECONDS)
-      info("Starting log flusher with a default period of %d ms.".format(flushCheckMs))
-      scheduler.schedule("kafka-log-flusher", 
-                         flushDirtyLogs, 
-                         delay = InitialTaskDelayMs, 
-                         period = flushCheckMs, 
-                         TimeUnit.MILLISECONDS)
+    if(config.enableZookeeper) {
+      kafkaZookeeper.registerBrokerInZk()
+      for (topic <- getAllTopics)
+        kafkaZookeeper.registerTopicInZk(topic)
+      startupLatch.countDown
     }
-    if(cleanerConfig.enableCleaner)
-      cleaner.startup()
+    info("Starting log flusher every " + config.flushSchedulerThreadRate + " ms with the following overrides " + logFlushIntervalMap)
+    logFlusherScheduler.scheduleWithRate(flushAllLogs, config.flushSchedulerThreadRate, config.flushSchedulerThreadRate)
   }
-  
-  /**
-   * Close all the logs
-   */
-  def shutdown() {
-    debug("Shutting down.")
-    try {
-      // stop the cleaner first
-      if(cleaner != null)
-        Utils.swallow(cleaner.shutdown())
-      // close the logs
-      allLogs.foreach(_.close())
-      // mark that the shutdown was clean by creating the clean shutdown marker file
-      logDirs.foreach(dir => Utils.swallow(new File(dir, CleanShutdownFile).createNewFile()))
-    } finally {
-      // regardless of whether the close succeeded, we need to unlock the data directories
-      dirLocks.foreach(_.destroy())
-    }
-    debug("Shutdown complete.")
+
+  private def awaitStartup() {
+    if (config.enableZookeeper)
+      startupLatch.await
   }
-  
-  /**
-   * Get the log if it exists, otherwise return None
-   */
-  def getLog(topicAndPartition: TopicAndPartition): Option[Log] = {
-    val log = logs.get(topicAndPartition)
-    if (log == null)
-      None
-    else
-      Some(log)
+
+  private def registerNewTopicInZK(topic: String) {
+    if (config.enableZookeeper)
+      zkActor ! topic 
   }
 
   /**
    * Create a log for the given topic and the given partition
-   * If the log already exists, just return a copy of the existing log
    */
-  def createLog(topicAndPartition: TopicAndPartition, config: LogConfig): Log = {
+  private def createLog(topic: String, partition: Int): Log = {
     logCreationLock synchronized {
-      var log = logs.get(topicAndPartition)
-      
-      // check if the log has already been created in another thread
-      if(log != null)
-        return log
-      
-      // if not, create it
-      val dataDir = nextLogDir()
-      val dir = new File(dataDir, topicAndPartition.topic + "-" + topicAndPartition.partition)
-      dir.mkdirs()
-      log = new Log(dir, 
-                    config,
-                    needsRecovery = false,
-                    scheduler,
-                    time)
-      logs.put(topicAndPartition, log)
-      info("Created log for topic %s partition %d in %s with properties {%s}."
-           .format(topicAndPartition.topic, 
-                   topicAndPartition.partition, 
-                   dataDir.getAbsolutePath,
-                   JavaConversions.asMap(config.toProps).mkString(", ")))
-      log
-    }
-  }
-  
-  /**
-   * Choose the next directory in which to create a log. Currently this is done
-   * by calculating the number of partitions in each directory and then choosing the
-   * data directory with the fewest partitions.
-   */
-  private def nextLogDir(): File = {
-    if(logDirs.size == 1) {
-      logDirs(0)
-    } else {
-      // count the number of logs in each parent directory (including 0 for empty directories
-      val logCounts = allLogs.groupBy(_.dir.getParent).mapValues(_.size)
-      val zeros = logDirs.map(dir => (dir.getPath, 0)).toMap
-      var dirCounts = (zeros ++ logCounts).toBuffer
-    
-      // choose the directory with the least logs in it
-      val leastLoaded = dirCounts.sortBy(_._2).head
-      new File(leastLoaded._1)
+      val d = new File(logDir, topic + "-" + partition)
+      d.mkdirs()
+      val rollIntervalMs = logRollMsMap.get(topic).getOrElse(this.logRollDefaultIntervalMs)
+      val maxLogFileSize = logFileSizeMap.get(topic).getOrElse(config.logFileSize)
+      new Log(d, time, maxLogFileSize, config.maxMessageSize, flushInterval, rollIntervalMs, false)
     }
   }
 
   /**
-   * Runs through the log removing segments older than a certain age
+   * Return the Pool (partitions) for a specific log
    */
+  private def getLogPool(topic: String, partition: Int): Pool[Int, Log] = {
+    awaitStartup
+    topicNameValidator.validate(topic)
+    if (partition < 0 || partition >= topicPartitionsMap.getOrElse(topic, numPartitions)) {
+      warn("Wrong partition " + partition + " valid partitions (0," +
+              (topicPartitionsMap.getOrElse(topic, numPartitions) - 1) + ")")
+      throw new InvalidPartitionException("wrong partition " + partition)
+    }
+    logs.get(topic)
+  }
+
+  /**
+   * Pick a random partition from the given topic
+   */
+  def chooseRandomPartition(topic: String): Int = {
+    random.nextInt(topicPartitionsMap.getOrElse(topic, numPartitions))
+  }
+
+  def getOffsets(offsetRequest: OffsetRequest): Array[Long] = {
+    val log = getLog(offsetRequest.topic, offsetRequest.partition)
+    if (log != null) return log.getOffsetsBefore(offsetRequest)
+    Log.getEmptyOffsets(offsetRequest)
+  }
+
+  /**
+   * Get the log if exists
+   */
+  def getLog(topic: String, partition: Int): Log = {
+    val parts = getLogPool(topic, partition)
+    if (parts == null) return null
+    parts.get(partition)
+  }
+
+  /**
+   * Create the log if it does not exist, if it exists just return it
+   */
+  def getOrCreateLog(topic: String, partition: Int): Log = {
+    var hasNewTopic = false
+    var parts = getLogPool(topic, partition)
+    if (parts == null) {
+      val found = logs.putIfNotExists(topic, new Pool[Int, Log])
+      if (found == null)
+        hasNewTopic = true
+      parts = logs.get(topic)
+    }
+    var log = parts.get(partition)
+    if(log == null) {
+      log = createLog(topic, partition)
+      val found = parts.putIfNotExists(partition, log)
+      if(found != null) {
+        // there was already somebody there
+        log.close()
+        log = found
+      }
+      else
+        info("Created log for '" + topic + "'-" + partition)
+    }
+
+    if (hasNewTopic)
+      registerNewTopicInZK(topic)
+    log
+  }
+  
+  /* Attemps to delete all provided segments from a log and returns how many it was able to */
+  private def deleteSegments(log: Log, segments: Seq[LogSegment]): Int = {
+    var total = 0
+    for(segment <- segments) {
+      info("Deleting log segment " + segment.file.getName() + " from " + log.name)
+      Utils.swallow(logger.warn, segment.messageSet.close())
+      if(!segment.file.delete()) {
+        warn("Delete failed.")
+      } else {
+        total += 1
+      }
+    }
+    total
+  }
+
+  /* Runs through the log removing segments older than a certain age */
   private def cleanupExpiredSegments(log: Log): Int = {
     val startMs = time.milliseconds
-    val topic = parseTopicPartitionName(log.name).topic
-    log.deleteOldSegments(startMs - _.lastModified > log.config.retentionMs)
+    val topic = Utils.getTopicPartition(log.dir.getName)._1
+    val logCleanupThresholdMS = logRetentionMsMap.get(topic).getOrElse(this.logCleanupDefaultAgeMs)
+    val toBeDeleted = log.markDeletedWhile(startMs - _.file.lastModified > logCleanupThresholdMS)
+    val total = deleteSegments(log, toBeDeleted)
+    total
   }
 
   /**
@@ -247,10 +255,10 @@ class LogManager(val logDirs: Array[File],
    *  is at least logRetentionSize bytes in size
    */
   private def cleanupSegmentsToMaintainSize(log: Log): Int = {
-    val topic = parseTopicPartitionName(log.dir.getName).topic
-    if(log.config.retentionSize < 0 || log.size < log.config.retentionSize)
-      return 0
-    var diff = log.size - log.config.retentionSize
+    val topic = Utils.getTopicPartition(log.dir.getName)._1
+    val maxLogRetentionSize = logRetentionSizeMap.get(topic).getOrElse(config.logRetentionSize)
+    if(maxLogRetentionSize < 0 || log.size < maxLogRetentionSize) return 0
+    var diff = log.size - maxLogRetentionSize
     def shouldDelete(segment: LogSegment) = {
       if(diff - segment.size >= 0) {
         diff -= segment.size
@@ -259,7 +267,9 @@ class LogManager(val logDirs: Array[File],
         false
       }
     }
-    log.deleteOldSegments(shouldDelete)
+    val toBeDeleted = log.markDeletedWhile( shouldDelete )
+    val total = deleteSegments(log, toBeDeleted)
+    total
   }
 
   /**
@@ -267,57 +277,81 @@ class LogManager(val logDirs: Array[File],
    */
   def cleanupLogs() {
     debug("Beginning log cleanup...")
+    val iter = getLogIterator
     var total = 0
     val startMs = time.milliseconds
-    for(log <- allLogs; if !log.config.dedupe) {
+    while(iter.hasNext) {
+      val log = iter.next
       debug("Garbage collecting '" + log.name + "'")
       total += cleanupExpiredSegments(log) + cleanupSegmentsToMaintainSize(log)
     }
-    debug("Log cleanup completed. " + total + " files deleted in " +
-                  (time.milliseconds - startMs) / 1000 + " seconds")
+    debug("Log cleanup completed. " + total + " files deleted in " + 
+                 (time.milliseconds - startMs) / 1000 + " seconds")
   }
-
-  /**
-   * Get all the partition logs
-   */
-  def allLogs(): Iterable[Log] = logs.values
   
   /**
-   * Get a map of TopicAndPartition => Log
+   * Close all the logs
    */
-  def logsByTopicPartition = logs.toMap
+  def close() {
+    logFlusherScheduler.shutdown()
+    val iter = getLogIterator
+    while(iter.hasNext)
+      iter.next.close()
+    if (config.enableZookeeper) {
+      zkActor ! StopActor
+      kafkaZookeeper.close
+    }
+  }
+  
+  private def getLogIterator(): Iterator[Log] = {
+    new IteratorTemplate[Log] {
+      val partsIter = logs.values.iterator
+      var logIter: Iterator[Log] = null
 
-  /**
-   * Flush any log which has exceeded its flush interval and has unwritten messages.
-   */
-  private def flushDirtyLogs() = {
-    debug("Checking for dirty logs to flush...")
-    for ((topicAndPartition, log) <- logs) {
-      try {
-        val timeSinceLastFlush = time.milliseconds - log.lastFlushTime
-        debug("Checking if flush is needed on " + topicAndPartition.topic + " flush interval  " + log.config.flushMs +
-              " last flushed " + log.lastFlushTime + " time since last flush: " + timeSinceLastFlush)
-        if(timeSinceLastFlush >= log.config.flushMs)
+      override def makeNext(): Log = {
+        while (true) {
+          if (logIter != null && logIter.hasNext)
+            return logIter.next
+          if (!partsIter.hasNext)
+            return allDone
+          logIter = partsIter.next.values.iterator
+        }
+        // should never reach here
+        assert(false)
+        return allDone
+      }
+    }
+  }
+
+  private def flushAllLogs() = {
+    debug("flushing the high watermark of all logs")
+
+    for (log <- getLogIterator)
+    {
+      try{
+        val timeSinceLastFlush = System.currentTimeMillis - log.getLastFlushedTime
+        var logFlushInterval = config.defaultFlushIntervalMs
+        if(logFlushIntervalMap.contains(log.getTopicName))
+          logFlushInterval = logFlushIntervalMap(log.getTopicName)
+        debug(log.getTopicName + " flush interval  " + logFlushInterval +
+            " last flushed " + log.getLastFlushedTime + " timesincelastFlush: " + timeSinceLastFlush)
+        if(timeSinceLastFlush >= logFlushInterval)
           log.flush
-      } catch {
+      }
+      catch {
         case e =>
-          error("Error flushing topic " + topicAndPartition.topic, e)
+          error("Error flushing topic " + log.getTopicName, e)
           e match {
             case _: IOException =>
               fatal("Halting due to unrecoverable I/O error while flushing logs: " + e.getMessage, e)
-              System.exit(1)
+              Runtime.getRuntime.halt(1)
             case _ =>
           }
       }
     }
   }
 
-  /**
-   * Parse the topic and partition out of the directory name of a log
-   */
-  private def parseTopicPartitionName(name: String): TopicAndPartition = {
-    val index = name.lastIndexOf('-')
-    TopicAndPartition(name.substring(0,index), name.substring(index+1).toInt)
-  }
 
+  def getAllTopics(): Iterator[String] = logs.keys.iterator
+  def getTopicPartitionsMap() = topicPartitionsMap
 }

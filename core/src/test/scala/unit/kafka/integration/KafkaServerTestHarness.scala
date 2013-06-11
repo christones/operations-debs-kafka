@@ -20,27 +20,26 @@ package kafka.integration
 import kafka.server._
 import kafka.utils.{Utils, TestUtils}
 import org.scalatest.junit.JUnit3Suite
-import kafka.zk.ZooKeeperTestHarness
-import kafka.common.KafkaException
 
 /**
  * A test harness that brings up some number of broker nodes
  */
-trait KafkaServerTestHarness extends JUnit3Suite with ZooKeeperTestHarness {
+trait KafkaServerTestHarness extends JUnit3Suite {
 
   val configs: List[KafkaConfig]
   var servers: List[KafkaServer] = null
 
   override def setUp() {
-    super.setUp
     if(configs.size <= 0)
-      throw new KafkaException("Must suply at least one server config.")
+      throw new IllegalArgumentException("Must suply at least one server config.")
     servers = configs.map(TestUtils.createServer(_))
+    super.setUp
   }
 
   override def tearDown() {
-    servers.map(server => server.shutdown())
-    servers.map(server => server.config.logDirs.map(Utils.rm(_)))
     super.tearDown
+    servers.map(server => server.shutdown())
+    servers.map(server => Utils.rm(server.config.logDir))
   }
+
 }

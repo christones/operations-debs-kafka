@@ -17,42 +17,16 @@
 
 package kafka.serializer
 
-import kafka.utils.VerifiableProperties
+import kafka.message.Message
 
-/**
- * An encoder is a method of turning objects into byte arrays.
- * An implementation is required to provide a constructor that
- * takes a VerifiableProperties instance.
- */
 trait Encoder[T] {
-  def toBytes(t: T): Array[Byte]
+  def toMessage(event: T):Message
 }
 
-/**
- * The default implementation is a no-op, it just returns the same array it takes in
- */
-class DefaultEncoder(props: VerifiableProperties = null) extends Encoder[Array[Byte]] {
-  override def toBytes(value: Array[Byte]): Array[Byte] = value
+class DefaultEncoder extends Encoder[Message] {
+  override def toMessage(event: Message):Message = event
 }
 
-class NullEncoder[T](props: VerifiableProperties = null) extends Encoder[T] {
-  override def toBytes(value: T): Array[Byte] = null
-}
-
-/**
- * The string encoder takes an optional parameter serializer.encoding which controls
- * the character set used in encoding the string into bytes.
- */
-class StringEncoder(props: VerifiableProperties = null) extends Encoder[String] {
-  val encoding = 
-    if(props == null) 
-      "UTF8" 
-    else 
-      props.getString("serializer.encoding", "UTF8")
-  
-  override def toBytes(s: String): Array[Byte] = 
-    if(s == null)
-      null
-    else
-      s.getBytes(encoding)
+class StringEncoder extends Encoder[String] {
+  override def toMessage(event: String):Message = new Message(event.getBytes)
 }

@@ -18,6 +18,7 @@
 package kafka
 
 import consumer._
+import message.Message
 import utils.Utils
 import java.util.concurrent.CountDownLatch
 
@@ -31,7 +32,7 @@ object TestZKConsumerOffsets {
     val topic = args(1)
     val autoOffsetReset = args(2)    
     val props = Utils.loadProps(args(0))
-    props.put("auto.offset.reset", "largest")
+    props.put("autooffset.reset", "largest")
     
     val config = new ConsumerConfig(props)
     val consumerConnector: ConsumerConnector = Consumer.create(config)
@@ -55,13 +56,13 @@ object TestZKConsumerOffsets {
   }
 }
 
-private class ConsumerThread(stream: KafkaStream[Array[Byte], Array[Byte]]) extends Thread {
+private class ConsumerThread(stream: KafkaStream[Message]) extends Thread {
   val shutdownLatch = new CountDownLatch(1)
 
   override def run() {
     println("Starting consumer thread..")
     for (messageAndMetadata <- stream) {
-      println("consumed: " + new String(messageAndMetadata.message, "UTF-8"))
+      println("consumed: " + Utils.toString(messageAndMetadata.message.payload, "UTF-8"))
     }
     shutdownLatch.countDown
     println("thread shutdown !" )

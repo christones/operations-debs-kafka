@@ -16,16 +16,22 @@
 */
 package kafka.producer.async
 
-import kafka.utils.VerifiableProperties
+import java.util.Properties
+import kafka.utils.Utils
+import kafka.producer.SyncProducerConfig
 
-trait AsyncProducerConfig {
-  val props: VerifiableProperties
+class AsyncProducerConfig(override val props: Properties) extends SyncProducerConfig(props)
+        with AsyncProducerConfigShared {
+}
+
+trait AsyncProducerConfigShared {
+  val props: Properties
 
   /* maximum time, in milliseconds, for buffering data on the producer queue */
-  val queueBufferingMaxMs = props.getInt("queue.buffering.max.ms", 5000)
+  val queueTime = Utils.getInt(props, "queue.time", 5000)
 
   /** the maximum size of the blocking queue for buffering on the producer */
-  val queueBufferingMaxMessages = props.getInt("queue.buffering.max.messages", 10000)
+  val queueSize = Utils.getInt(props, "queue.size", 10000)
 
   /**
    * Timeout for event enqueue:
@@ -33,15 +39,23 @@ trait AsyncProducerConfig {
    * -ve: enqueue will block indefinitely if the queue is full
    * +ve: enqueue will block up to this many milliseconds if the queue is full
    */
-  val queueEnqueueTimeoutMs = props.getInt("queue.enqueue.timeout.ms", -1)
+  val enqueueTimeoutMs = Utils.getInt(props, "queue.enqueueTimeout.ms", 0)
 
   /** the number of messages batched at the producer */
-  val batchNumMessages = props.getInt("batch.num.messages", 200)
+  val batchSize = Utils.getInt(props, "batch.size", 200)
 
-  /** the serializer class for values */
-  val serializerClass = props.getString("serializer.class", "kafka.serializer.DefaultEncoder")
-  
-  /** the serializer class for keys (defaults to the same as for values) */
-  val keySerializerClass = props.getString("key.serializer.class", serializerClass)
-  
+  /** the serializer class for events */
+  val serializerClass = Utils.getString(props, "serializer.class", "kafka.serializer.DefaultEncoder")
+
+  /** the callback handler for one or multiple events */
+  val cbkHandler = Utils.getString(props, "callback.handler", null)
+
+  /** properties required to initialize the callback handler */
+  val cbkHandlerProps = Utils.getProps(props, "callback.handler.props", null)
+
+  /** the handler for events */
+  val eventHandler = Utils.getString(props, "event.handler", null)
+
+  /** properties required to initialize the callback handler */
+  val eventHandlerProps = Utils.getProps(props, "event.handler.props", null)
 }
